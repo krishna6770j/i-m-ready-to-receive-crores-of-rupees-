@@ -40,6 +40,29 @@ def test_manifest_records_provenance(tmp_store, ohlcv):
     assert len(manifest.content_sha256) == 64
 
 
+def test_manifest_records_software_versions(tmp_store, ohlcv):
+    """Provenance must capture the code that produced the data."""
+    _, manifest = store.write(
+        ohlcv, tmp_store, symbol="X:Y", resolution="1", source="test"
+    )
+    software = manifest.software
+    assert software["python"].startswith("3.12")
+    assert software["pandas"] == pd.__version__
+    for key in ("numpy", "pyarrow", "fyers-apiv3", "platform", "git_revision"):
+        assert key in software and software[key]
+
+
+def test_git_revision_is_reported():
+    rev = store.git_revision()
+    assert rev and rev != "unknown"
+
+
+def test_software_versions_survive_manifest_round_trip(tmp_store, ohlcv):
+    store.write(ohlcv, tmp_store, symbol="X:Y", resolution="1", source="t")
+    _, manifest = store.read(tmp_store, "X:Y", "1")
+    assert manifest.software["pandas"] == pd.__version__
+
+
 def test_identical_data_hashes_identically():
     """Same input twice -> same hash. This is the reproducibility guarantee."""
     a = make_ohlcv(50, seed=7)

@@ -165,6 +165,36 @@ def test_session_boundary_is_info_not_warning():
     assert "WITHIN_DAY_GAPS" not in codes(report)
 
 
+def test_session_window_check_is_skipped_when_not_supplied(ohlcv):
+    """Unconfirmed NSE hours must not be guessed at."""
+    report = run(ohlcv, expected_interval_minutes=1)
+    assert "SESSION_WINDOW_NOT_CHECKED" in codes(report)
+    issue = next(i for i in report.issues if i.code == "SESSION_WINDOW_NOT_CHECKED")
+    assert issue.severity is Severity.INFO
+
+
+def test_session_window_accepts_candles_inside_it(ohlcv):
+    from datetime import time as t
+
+    report = run(
+        ohlcv, expected_interval_minutes=1, session_window=(t(9, 15), t(15, 40))
+    )
+    assert "OUTSIDE_SESSION_WINDOW" not in codes(report)
+    assert "SESSION_WINDOW_NOT_CHECKED" not in codes(report)
+
+
+def test_session_window_flags_candles_outside_it():
+    from datetime import time as t
+
+    frame = make_ohlcv(30, start="2026-01-01 15:35")
+    report = run(
+        frame, expected_interval_minutes=1, session_window=(t(9, 15), t(15, 40))
+    )
+    assert "OUTSIDE_SESSION_WINDOW" in codes(report)
+    issue = next(i for i in report.issues if i.code == "OUTSIDE_SESSION_WINDOW")
+    assert issue.count == 24  # 15:41..16:04 fall outside
+
+
 def test_report_serialises_and_renders(ohlcv):
     report = run(ohlcv, expected_interval_minutes=1)
     assert isinstance(report.to_dict(), dict)

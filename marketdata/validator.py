@@ -13,6 +13,7 @@ specific rows to inspect.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import time
 from enum import Enum
 
 import numpy as np
@@ -165,6 +166,7 @@ def validate(
     resolution: str,
     expected_interval_minutes: int | None = None,
     sigma_threshold: float = 10.0,
+    session_window: tuple[time, time] | None = None,
 ) -> ValidationReport:
     """Run all data quality checks and return a structured report.
 
@@ -176,6 +178,11 @@ def validate(
             None, gap detection is skipped rather than guessed at.
         sigma_threshold: Bar-to-bar return z-score beyond which a move is
             flagged for human review.
+        session_window: Optional (start, end) wall-clock IST times that every
+            candle must fall within, inclusive. When None the check is SKIPPED
+            and recorded as skipped -- NSE session boundaries changed on
+            2026-08-03 and the exact windows differ by segment and remain
+            unconfirmed, so guessing them would manufacture false failures.
     """
     has_ts = TS in frame.columns
     tz_attr = getattr(frame[TS].dtype, "tz", None) if has_ts else None
@@ -387,6 +394,36 @@ def validate(
                     Severity.INFO,
                     f"{int(overnight.sum())} day boundaries detected (expected).",
                     count=int(overnight.sum()),
+                )
+            )
+
+    # --- session boundaries ------------------------------------------------
+    if session_window is None:
+        report.add(
+            ValidationIssue(
+                "SESSION_WINDOW_NOT_CHECKED",
+                Severity.INFO,
+                "No session window supplied, so candles were NOT checked against "
+                "trading hours. NSE changed session boundaries on 2026-08-03 and "
+                "the exact windows per segment are unconfirmed; supply "
+                "session_window once the execution instrument and its segment "
+                "are settled.",
+                count=1,
+            )
+        )
+    else:
+        start, end = session_window
+        wall = frame[TS].dt.time
+        outside = (wall < start) | (wall > end)
+        if outside.any():
+            report.add(
+                ValidationIssue(
+                    "OUTSIDE_SESSION_WINDOW",
+                    Severity.WARNING,
+                    f"Candles fall outside the configured session "
+                    f"{start.isoformat()}-{end.isoformat()} IST.",
+                    count=int(outside.sum()),
+                    samples=_samples(frame.loc[outside, TS]),
                 )
             )
 
