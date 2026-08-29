@@ -1,0 +1,30 @@
+# --- Secrets: never commit ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+token_cache.json
+
+# --- Generated data and logs ---
+data_store/
+logs/
+reports/
+*.parquet
+fyersApi.log
+fyersRequests.log
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/

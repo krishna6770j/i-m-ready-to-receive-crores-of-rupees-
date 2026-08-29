@@ -1,0 +1,82 @@
+# Instrument definitions.
+#
+# STATUS: NO EXECUTION INSTRUMENT HAS BEEN SELECTED.
+#
+# The entries under `execution_candidates` are candidates to be EVALUATED, not
+# choices that have been made. Selection is a research decision that depends on
+# liquidity, spread, cost, margin and granularity analysis that has not been
+# performed. Do not treat any entry here as decided.
+#
+# Numeric fields marked `null` are UNVERIFIED. They are deliberately left empty
+# rather than filled with plausible guesses, so that code which needs them
+# fails loudly instead of silently computing with invented values.
+
+signal_instruments:
+  - symbol: "NSE:NIFTY50-INDEX"
+    name: "NIFTY 50 Index"
+    kind: index
+    role: signal
+    lot_size: 1
+    tick_size: null
+    exchange: NSE
+    notes: >-
+      Signal source only. Not tradable. Symbol format observed in FYERS
+      community documentation; to be confirmed against the FYERS symbol master
+      once credentials are available.
+
+# Candidate execution instruments -- FOR EVALUATION, NOT SELECTED.
+#
+# Each requires verification of lot size, tick size, margin, liquidity,
+# spread and full cost stack before it can be used. The `verified` flag is
+# false for all of them because none has been checked against live data.
+execution_candidates:
+  - symbol: "NSE:NIFTYBEES-EQ"
+    name: "Nippon India ETF Nifty 50 BeES"
+    kind: etf
+    role: execution
+    lot_size: 1
+    tick_size: null
+    exchange: NSE
+    verified: false
+    notes: >-
+      ETF tracking NIFTY 50. Cash segment, so tradable in single units, which
+      gives finer position granularity than derivatives. Needs verification of
+      tick size, intraday liquidity, bid/ask spread and tracking error against
+      the index. Candidate only.
+
+  - symbol: "NSE:NIFTY50-FUT"
+    name: "NIFTY 50 Futures (near month)"
+    kind: futures
+    role: execution
+    lot_size: null
+    tick_size: null
+    exchange: NSE
+    verified: false
+    notes: >-
+      Placeholder. Actual tradable symbol is expiry-specific and must come from
+      the FYERS symbol master, not be constructed by hand. Lot size and margin
+      are unverified; Phase 0 analysis suggests margin likely exceeds the
+      10,000 rupee account, which must be confirmed before serious evaluation.
+
+  - symbol: null
+    name: "NIFTY 50 Options"
+    kind: options
+    role: execution
+    lot_size: null
+    tick_size: null
+    exchange: NSE
+    verified: false
+    notes: >-
+      Candidate retained for completeness only. Options have a non-linear
+      relationship to the index signal (delta, theta, implied volatility), so
+      an index-derived signal does not transfer directly. Would additionally
+      require historical option chain data, which is harder to source and
+      validate. Evaluate only if explicitly directed.
+
+# Session boundaries are intentionally absent from this file.
+#
+# NSE extended equity derivatives close to 15:40 IST effective 2026-08-03, and
+# a Closing Auction Session was introduced in the cash segment. Secondary
+# sources conflict on the exact CAS windows and NSE's own site was unreachable
+# during Phase 0 research. Session times differ by segment, so they cannot be
+# fixed until the execution instrument is chosen. See Phase 0 section G.
