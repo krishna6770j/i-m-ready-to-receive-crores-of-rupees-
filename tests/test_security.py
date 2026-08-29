@@ -120,6 +120,70 @@ def test_no_order_placement_calls_in_source():
     assert not offenders, f"Order-placement calls found: {offenders}"
 
 
+def test_no_source_file_prints_a_secret_value():
+    """`print(f"...{token}")` style leaks must not exist.
+
+    Catches the specific mistake of echoing a credential to stdout, which is
+    not caught by log redaction because it never reaches the logging system.
+    """
+    import ast
+
+    secret_names = {"token", "access_token", "secret_key", "secret", "password"}
+    offenders = []
+    for path in _source_files():
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "print"
+            ):
+                continue
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Name) and sub.id in secret_names:
+                    offenders.append(
+                        f"{path.relative_to(PROJECT_ROOT)}:{node.lineno}"
+                    )
+    assert not offenders, f"Secret printed to stdout at: {offenders}"
+
+
+def test_login_writes_token_without_printing_it(tmp_path):
+    """The token reaches .env, with other keys preserved and mode 0600."""
+    import stat
+    import sys
+
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    from fyers_login import write_token_to_env
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "TRADING_MODE=paper\nFYERS_CLIENT_ID=ABC-100\nFYERS_ACCESS_TOKEN=old\n"
+    )
+    write_token_to_env("brandnewtoken123", env_path)
+
+    content = env_path.read_text()
+    assert "FYERS_ACCESS_TOKEN=brandnewtoken123" in content
+    assert "TRADING_MODE=paper" in content
+    assert "FYERS_CLIENT_ID=ABC-100" in content
+    assert "old" not in content
+
+    mode = stat.S_IMODE(env_path.stat().st_mode)
+    assert mode == 0o600, f"expected 0600, got {oct(mode)}"
+
+
+def test_login_appends_token_when_absent(tmp_path):
+    import sys
+
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    from fyers_login import write_token_to_env
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("TRADING_MODE=paper\n")
+    write_token_to_env("tok", env_path)
+    assert "FYERS_ACCESS_TOKEN=tok" in env_path.read_text()
+    assert "TRADING_MODE=paper" in env_path.read_text()
+
+
 # --- trading mode safety -------------------------------------------------
 
 

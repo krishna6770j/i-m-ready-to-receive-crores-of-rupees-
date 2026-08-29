@@ -7,20 +7,50 @@ continuous refresh-token sessions under the SEBI framework effective
 
     python scripts/fyers_login.py
 
-The token is printed ONLY as an instruction to store it in .env; it is never
-written to a log file. You paste it into your local .env yourself -- this
-script does not write your secrets for you, and never sends them anywhere.
+The token is NEVER printed and never logged. It is written directly into your
+local .env file, which is gitignored and given owner-only permissions. The
+value stays on this machine and is not transmitted anywhere by this script.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from brokers.fyers import auth  # noqa: E402
-from config.settings import load_settings  # noqa: E402
+from config.settings import PROJECT_ROOT, load_settings  # noqa: E402
+
+TOKEN_KEY = "FYERS_ACCESS_TOKEN"
+
+
+def write_token_to_env(token: str, env_path: Path) -> None:
+    """Replace (or append) the token line in .env without printing the value.
+
+    Preserves every other line. The file is written with mode 0600 so it is
+    readable only by its owner.
+    """
+    lines = (
+        env_path.read_text(encoding="utf-8").splitlines()
+        if env_path.exists()
+        else []
+    )
+    replaced = False
+    for index, line in enumerate(lines):
+        if line.strip().startswith(f"{TOKEN_KEY}="):
+            lines[index] = f"{TOKEN_KEY}={token}"
+            replaced = True
+            break
+    if not replaced:
+        lines.append(f"{TOKEN_KEY}={token}")
+
+    # Create with restrictive permissions before any content is written.
+    fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    os.chmod(env_path, 0o600)
 
 
 def main() -> int:
@@ -61,11 +91,20 @@ def main() -> int:
         print(f"\nLogin failed: {exc}")
         return 1
 
-    print("\nAccess token obtained. Add this line to your local .env file:\n")
-    print(f"FYERS_ACCESS_TOKEN={token}")
-    print("\nDo not commit .env. Do not paste this token into source code,")
-    print("into chat, or into any shared location. It expires and must be")
-    print("regenerated on the next trading day.")
+    env_path = PROJECT_ROOT / ".env"
+    try:
+        write_token_to_env(token, env_path)
+    except OSError as exc:
+        print(f"\nToken obtained but could not be written to {env_path}: {exc}")
+        print("Set FYERS_ACCESS_TOKEN in your .env manually. The value is not")
+        print("printed here deliberately.")
+        return 1
+
+    print(f"\nAccess token obtained and written to {env_path} (mode 0600).")
+    print("The value is not displayed, by design.")
+    print("\n.env is gitignored. Do not commit it, do not paste the token into")
+    print("source code or chat. It expires and must be regenerated on the next")
+    print("trading day.")
     return 0
 
 
