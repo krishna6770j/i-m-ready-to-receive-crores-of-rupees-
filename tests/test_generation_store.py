@@ -277,9 +277,18 @@ def test_write_sequence_order_matches_architecture(tmp_path, monkeypatch):
     result = write_generation(ds, env, tmp_path)
 
     gid = str(env.generation_id)
-    dataset_dir_name = safe_slug(env.resolution)
+    source_slug = safe_slug(env.source)
+    symbol_slug = safe_slug(env.symbol)
+    resolution_slug = safe_slug(env.resolution)
 
     assert calls == [
+        # Hierarchy creation: every component here is newly created (empty
+        # tmp_path), so each is followed immediately by an fsync of its
+        # parent (section 13.3 correction).
+        ("fsync_dir", tmp_path.name),  # created source_dir -> fsync(root)
+        ("fsync_dir", source_slug),  # created symbol_dir -> fsync(source_dir)
+        ("fsync_dir", symbol_slug),  # created resolution_dir -> fsync(symbol_dir)
+        ("fsync_dir", resolution_slug),  # created namespace_dir -> fsync(resolution_dir)
         ("write_data_parquet", "data.parquet"),
         ("fsync_file", "data.parquet"),
         ("write_text", "manifest.json"),
@@ -289,7 +298,7 @@ def test_write_sequence_order_matches_architecture(tmp_path, monkeypatch):
         ("write_text", "CURRENT.tmp"),
         ("fsync_file", "CURRENT.tmp"),
         ("replace", None),
-        ("fsync_dir", dataset_dir_name),
+        ("fsync_dir", resolution_slug),
     ]
 
 
@@ -458,3 +467,234 @@ def test_previous_trusted_generation_remains_intact_after_failed_new_write(tmp_p
     assert (result0.generation_dir / "manifest.json").read_text() == original_manifest
     pointer = CurrentPointer.from_json(_current_path(result0).read_text())
     assert pointer.generation_id == env0.generation_id
+
+
+# ---------------------------------------------------------------------------
+# hierarchy durability (manager correction)
+# ---------------------------------------------------------------------------
+
+
+def test_missing_hierarchy_created_component_by_component(tmp_path):
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds)
+    write_generation(ds, env, tmp_path)
+
+    source_dir = tmp_path / safe_slug(env.source)
+    symbol_dir = source_dir / safe_slug(env.symbol)
+    resolution_dir = symbol_dir / safe_slug(env.resolution)
+    assert source_dir.is_dir()
+    assert symbol_dir.is_dir()
+    assert resolution_dir.is_dir()
+    assert (resolution_dir / "trusted_generations").is_dir()
+
+
+def test_parent_fsync_follows_each_newly_created_hierarchy_component(tmp_path, monkeypatch):
+    fsynced_dirs: list[str] = []
+    orig_fsync_dir = generation_store._fsync_dir
+
+    def fsync_dir(path):
+        fsynced_dirs.append(Path(path).name)
+        return orig_fsync_dir(path)
+
+    monkeypatch.setattr(generation_store, "_fsync_dir", fsync_dir)
+
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds)
+    write_generation(ds, env, tmp_path)
+
+    source_slug = safe_slug(env.source)
+    symbol_slug = safe_slug(env.symbol)
+    resolution_slug = safe_slug(env.resolution)
+
+    # The first four fsync_dir calls are the hierarchy-creation parent
+    # fsyncs, one per newly-created component, in creation order.
+    assert fsynced_dirs[:4] == [tmp_path.name, source_slug, symbol_slug, resolution_slug]
+
+
+def test_existing_hierarchy_does_not_require_recreation(tmp_path, monkeypatch):
+    ds0 = _dataset(base=1.0)
+    env0 = ProvenanceEnvelope.build(ds0)
+    write_generation(ds0, env0, tmp_path)
+
+    fsynced_dirs: list[str] = []
+    orig_fsync_dir = generation_store._fsync_dir
+
+    def fsync_dir(path):
+        fsynced_dirs.append(Path(path).name)
+        return orig_fsync_dir(path)
+
+    monkeypatch.setattr(generation_store, "_fsync_dir", fsync_dir)
+
+    ds1 = _dataset(base=2.0)  # same identity -> hierarchy already exists
+    env1 = ProvenanceEnvelope.build(ds1)
+    write_generation(ds1, env1, tmp_path)
+
+    source_slug = safe_slug(env1.source)
+    symbol_slug = safe_slug(env1.symbol)
+    resolution_slug = safe_slug(env1.resolution)
+    gid = str(env1.generation_id)
+
+    # No hierarchy-creation fsyncs at all: every component already existed,
+    # so _ensure_dir_component short-circuits before ever calling
+    # _fsync_dir for source/symbol/resolution/namespace.
+    assert tmp_path.name not in fsynced_dirs
+    assert source_slug not in fsynced_dirs
+    assert symbol_slug not in fsynced_dirs
+    # Only the ordinary per-write fsyncs remain: generation dir (step 6),
+    # namespace dir (step 7, unconditional -- not part of hierarchy
+    # creation), and the dataset-dir fsync after CURRENT replacement (step 8).
+    assert fsynced_dirs == [gid, "trusted_generations", resolution_slug]
+
+
+def test_forced_first_write_gets_same_durable_hierarchy_treatment(tmp_path, monkeypatch):
+    fsynced_dirs: list[str] = []
+    orig_fsync_dir = generation_store._fsync_dir
+
+    def fsync_dir(path):
+        fsynced_dirs.append(Path(path).name)
+        return orig_fsync_dir(path)
+
+    monkeypatch.setattr(generation_store, "_fsync_dir", fsync_dir)
+
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds, forced=True, force_reason="backfill")
+    write_generation(ds, env, tmp_path)
+
+    source_slug = safe_slug(env.source)
+    symbol_slug = safe_slug(env.symbol)
+    resolution_slug = safe_slug(env.resolution)
+    assert fsynced_dirs[:4] == [tmp_path.name, source_slug, symbol_slug, resolution_slug]
+
+
+def test_missing_root_raises_clear_error_without_implicit_creation(tmp_path):
+    missing_root = tmp_path / "does_not_exist_yet"
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds)
+
+    with pytest.raises(generation_store.GenerationStoreError):
+        write_generation(ds, env, missing_root)
+
+    assert not missing_root.exists()
+
+
+def test_root_is_a_file_raises_clear_error(tmp_path):
+    file_root = tmp_path / "not_a_directory"
+    file_root.write_text("surprise")
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds)
+
+    with pytest.raises(generation_store.GenerationStoreError):
+        write_generation(ds, env, file_root)
+
+
+# ---------------------------------------------------------------------------
+# hierarchy / component fsync failure injection
+# ---------------------------------------------------------------------------
+
+
+def test_hierarchy_parent_fsync_failure_leaves_no_current(tmp_path, monkeypatch):
+    def boom(path):
+        raise OSError("simulated fsync failure")
+
+    monkeypatch.setattr(generation_store, "_fsync_dir", boom)
+
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds)
+    with pytest.raises(OSError):
+        write_generation(ds, env, tmp_path)
+
+    current_path = tmp_path / safe_slug(env.source) / safe_slug(env.symbol) / safe_slug(env.resolution) / "CURRENT"
+    assert not current_path.exists()
+
+
+def test_data_file_fsync_failure_leaves_previous_current_unchanged(tmp_path, monkeypatch):
+    ds0 = _dataset(base=1.0)
+    env0 = ProvenanceEnvelope.build(ds0)
+    result0 = write_generation(ds0, env0, tmp_path)
+    current_before = _current_path(result0).read_text()
+
+    orig_fsync_file = generation_store._fsync_file
+
+    def selective_boom(path):
+        if Path(path).name == "data.parquet":
+            raise OSError("simulated fsync failure")
+        return orig_fsync_file(path)
+
+    monkeypatch.setattr(generation_store, "_fsync_file", selective_boom)
+
+    ds1 = _dataset(base=2.0)
+    env1 = ProvenanceEnvelope.build(ds1)
+    with pytest.raises(OSError):
+        write_generation(ds1, env1, tmp_path)
+
+    assert _current_path(result0).read_text() == current_before
+
+
+def test_manifest_fsync_failure_leaves_previous_current_unchanged(tmp_path, monkeypatch):
+    ds0 = _dataset(base=1.0)
+    env0 = ProvenanceEnvelope.build(ds0)
+    result0 = write_generation(ds0, env0, tmp_path)
+    current_before = _current_path(result0).read_text()
+
+    orig_fsync_file = generation_store._fsync_file
+
+    def selective_boom(path):
+        if Path(path).name == "manifest.json":
+            raise OSError("simulated fsync failure")
+        return orig_fsync_file(path)
+
+    monkeypatch.setattr(generation_store, "_fsync_file", selective_boom)
+
+    ds1 = _dataset(base=2.0)
+    env1 = ProvenanceEnvelope.build(ds1)
+    with pytest.raises(OSError):
+        write_generation(ds1, env1, tmp_path)
+
+    assert _current_path(result0).read_text() == current_before
+
+
+def test_generation_dir_fsync_failure_leaves_previous_current_unchanged(tmp_path, monkeypatch):
+    ds0 = _dataset(base=1.0)
+    env0 = ProvenanceEnvelope.build(ds0)
+    result0 = write_generation(ds0, env0, tmp_path)
+    current_before = _current_path(result0).read_text()
+
+    orig_fsync_dir = generation_store._fsync_dir
+
+    def selective_boom(path):
+        if Path(path).name == str(env1.generation_id):
+            raise OSError("simulated fsync failure")
+        return orig_fsync_dir(path)
+
+    ds1 = _dataset(base=2.0)
+    env1 = ProvenanceEnvelope.build(ds1)
+    monkeypatch.setattr(generation_store, "_fsync_dir", selective_boom)
+
+    with pytest.raises(OSError):
+        write_generation(ds1, env1, tmp_path)
+
+    assert _current_path(result0).read_text() == current_before
+
+
+def test_namespace_dir_fsync_failure_leaves_previous_current_unchanged(tmp_path, monkeypatch):
+    ds0 = _dataset(base=1.0)
+    env0 = ProvenanceEnvelope.build(ds0)
+    result0 = write_generation(ds0, env0, tmp_path)
+    current_before = _current_path(result0).read_text()
+
+    orig_fsync_dir = generation_store._fsync_dir
+    calls_to_namespace = {"count": 0}
+
+    def selective_boom(path):
+        if Path(path).name == "trusted_generations":
+            raise OSError("simulated fsync failure")
+        return orig_fsync_dir(path)
+
+    monkeypatch.setattr(generation_store, "_fsync_dir", selective_boom)
+
+    ds1 = _dataset(base=2.0)
+    env1 = ProvenanceEnvelope.build(ds1)
+    with pytest.raises(OSError):
+        write_generation(ds1, env1, tmp_path)
+
+    assert _current_path(result0).read_text() == current_before

@@ -634,7 +634,26 @@ strict rejection of unknown fields on read; **no absolute paths**;
 
 ### 13.3 Atomic write and durability
 
-Create generation directory → write `data.parquet` → flush → `fsync` → write
+**Correction (manager review of Unit 8's implementation).** The dataset
+hierarchy (`<source_slug>/<symbol_slug>/<resolution_slug>/<namespace>`) must
+not be created with one opaque `mkdir(parents=True)`. A newly-created
+directory ENTRY is made crash-durable by fsyncing its PARENT, not by
+fsyncing the new directory itself — a single `mkdir(parents=True)` call
+creates every missing intermediate component but gives no opportunity to
+fsync each one's parent in turn, so on a dataset's first-ever write, the
+new `source`/`symbol`/`resolution`/`namespace` directory entries were not
+actually durable, even though the generation contents beneath them were.
+
+Each missing hierarchy component must instead be created individually,
+immediately followed by an `fsync` of the parent it was just created in.
+An already-existing component is not recreated and does not need a fresh
+fsync — its entry's durability was already established when it was first
+created. `root` itself is required to already exist (and be a directory);
+this module never creates arbitrary root ancestors implicitly.
+
+Full sequence: for each of `source`, `symbol`, `resolution`, `namespace` —
+if the component is missing, create it, then `fsync` its parent — then:
+create generation directory → write `data.parquet` → flush → `fsync` → write
 `manifest.json` → flush → `fsync` → `fsync` generation directory → `fsync`
 namespace directory → write `CURRENT.tmp` in the same parent → flush → `fsync` →
 `os.replace(CURRENT.tmp, CURRENT)` → `fsync` dataset parent directory.

@@ -202,17 +202,61 @@ def _verify_consistency(dataset: ValidatedDataset, envelope: ProvenanceEnvelope)
 # --- location helpers (reuses Unit 7's safe slugs) --------------------------
 
 
-def _dataset_dir(root: Path, envelope: ProvenanceEnvelope) -> Path:
-    return (
-        Path(root)
-        / safe_slug(envelope.source)
-        / safe_slug(envelope.symbol)
-        / safe_slug(envelope.resolution)
-    )
-
-
 def _namespace_dirname(namespace: Namespace) -> str:
     return _TRUSTED_DIRNAME if namespace is Namespace.TRUSTED else _FORCED_DIRNAME
+
+
+def _require_existing_dir(path: Path, label: str) -> Path:
+    """``root`` (and only ``root``) must already exist as a directory --
+    this module never creates it implicitly. Below ``root``, every missing
+    hierarchy component IS created, deliberately, by
+    :func:`_ensure_dir_component`.
+    """
+    if not path.exists():
+        raise GenerationStoreError(
+            f"{label} {path} does not exist. It must be created explicitly "
+            "before writing generations -- this module never creates "
+            "arbitrary root ancestors implicitly."
+        )
+    if not path.is_dir():
+        raise GenerationStoreError(f"{label} {path} exists but is not a directory.")
+    return path
+
+
+def _ensure_dir_component(parent: Path, name: str) -> Path:
+    """Create ``parent/name`` if it does not already exist, then fsync
+    ``parent`` -- a NEWLY-CREATED directory ENTRY is made crash-durable by
+    fsyncing its PARENT, never by fsyncing the new directory itself (there
+    is nothing inside it yet to make durable that way; the fact that the
+    entry now exists in ``parent``'s listing is what fsyncing ``parent``
+    commits). If ``parent/name`` already exists, nothing is created and no
+    fsync happens here -- its entry's durability was already established
+    whenever it was first created; this module does not re-fsync an
+    unchanged, pre-existing directory on every write.
+    """
+    child = parent / name
+    if child.exists():
+        if not child.is_dir():
+            raise GenerationStoreError(f"{child} exists but is not a directory.")
+        return child
+    child.mkdir()
+    _fsync_dir(parent)
+    return child
+
+
+def _ensure_dataset_dir(root: Path, envelope: ProvenanceEnvelope) -> Path:
+    """``root/<source_slug>/<symbol_slug>/<resolution_slug>``, creating any
+    missing component deliberately -- never one opaque
+    ``mkdir(parents=True)`` -- so each newly-created component's parent is
+    fsynced immediately, making the new entry crash-durable before the next
+    component (or generation persistence) proceeds. ``root`` itself must
+    already exist (see :func:`_require_existing_dir`).
+    """
+    root = _require_existing_dir(Path(root), "root")
+    source_dir = _ensure_dir_component(root, safe_slug(envelope.source))
+    symbol_dir = _ensure_dir_component(source_dir, safe_slug(envelope.symbol))
+    resolution_dir = _ensure_dir_component(symbol_dir, safe_slug(envelope.resolution))
+    return resolution_dir
 
 
 # --- public write API --------------------------------------------------------
@@ -232,8 +276,15 @@ def write_generation(
     """
     _verify_consistency(dataset, envelope)
 
-    dataset_dir = _dataset_dir(root, envelope)
-    namespace_dir = dataset_dir / _namespace_dirname(envelope.namespace)
+    # Component-by-component, parent-fsynced hierarchy creation (section
+    # 13.3 correction): root/source/symbol/resolution/namespace. Each
+    # newly-created component's parent is fsynced immediately -- see
+    # _ensure_dir_component -- rather than one opaque
+    # mkdir(parents=True, exist_ok=True), which would leave every newly
+    # created intermediate directory entry un-fsynced and therefore not
+    # crash-durable.
+    dataset_dir = _ensure_dataset_dir(root, envelope)
+    namespace_dir = _ensure_dir_component(dataset_dir, _namespace_dirname(envelope.namespace))
     generation_dir = namespace_dir / str(envelope.generation_id)
 
     if generation_dir.exists():
@@ -242,7 +293,6 @@ def write_generation(
             f"{generation_dir}; refusing to overwrite an existing generation."
         )
 
-    namespace_dir.mkdir(parents=True, exist_ok=True)
     try:
         generation_dir.mkdir()
     except FileExistsError as exc:
