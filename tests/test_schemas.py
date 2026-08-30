@@ -111,7 +111,7 @@ def test_normalise_does_not_fabricate_missing_volume():
     frame.loc[2, VOLUME] = pd.NA
     out = normalise(frame)
     assert pd.isna(out.loc[2, VOLUME]), "missing volume must stay missing"
-    assert out.loc[2, VOLUME] is not 0  # noqa: F632 - explicit intent
+    assert (out[VOLUME] == 0).sum() == 0, "no volume may have been filled with 0"
 
 
 def test_normalise_preserves_already_missing_prices():
