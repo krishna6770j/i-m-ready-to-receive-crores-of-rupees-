@@ -97,13 +97,26 @@ class CanonicalisationAnomaly:
 
 @dataclass(frozen=True)
 class SourceEvidence:
-    """Facts about the input as it arrived, measured before any transformation.
+    """Facts about the input AS RECEIVED, measured before any canonical
+    transformation (timezone conversion, numeric coercion, column reordering
+    or sorting). If the source used a different type or representation for
+    two values that later convert to the same canonical number, that
+    difference is what this evidence reflects -- not the post-conversion
+    result. See ``canonicalise()`` for where the line is drawn.
 
     ``descending_adjacent_pairs`` is defined precisely so it means the same
     thing regardless of duplicate timestamps: the count of adjacent row pairs
     (i, i+1) in the INPUT row order where timestamp[i] > timestamp[i+1]. Equal
     timestamps are never counted as a descent, so this is well-defined even
     when duplicate timestamps are present.
+
+    ``exact_duplicate_row_count`` counts rows whose values, AS RECEIVED
+    (before any type conversion), are equal to an earlier row's values under
+    the source DataFrame's own dtypes. This is value-equality at the source
+    representation, not byte-identity of any underlying storage -- two rows
+    that later convert to the same canonical number but arrived in different
+    forms (e.g. the int ``1`` and the string ``"1"``) are NOT counted as
+    duplicates here, because they were not equal as received.
     """
 
     row_count: int
@@ -263,24 +276,12 @@ def canonicalise(frame: pd.DataFrame) -> CanonicalisationResult:
             "Naive timestamps are rejected: this project never assumes a timezone."
         )
 
-    if str(out[TS].dtype.tz) != IST_NAME:
-        source_tz = out[TS].dtype.tz
-        out[TS] = out[TS].dt.tz_convert(IST_NAME)
-        transformations.append(
-            CanonicalisationTransformation(
-                "TIMEZONE_CONVERTED",
-                f"Converted timestamps from {source_tz} to {IST_NAME}, "
-                "preserving the instant.",
-            )
-        )
-
-    for col in PRICE_COLUMNS:
-        out[col] = _to_numeric_strict(out[col], col).astype("float64")
-    out[VOLUME] = _to_whole_number_strict(out[VOLUME], VOLUME)
-
-    # Ordering evidence is measured on the post-coercion, PRE-SORT frame, so
-    # it reflects the source's actual row order rather than an order already
-    # altered by a prior step in this function.
+    # --- SOURCE-level evidence -------------------------------------------
+    # Everything in this block is measured on `out` EXACTLY as received: no
+    # timezone conversion, no numeric coercion has happened yet. This is what
+    # makes SourceEvidence actually describe the source (manager correction):
+    # a value that only becomes equal to another after later conversion must
+    # not be reported as an equal/duplicate observation here.
     ts_series = out[TS]
     if row_count > 1:
         descending_adjacent_pairs = int((ts_series.diff().dt.total_seconds() < 0).sum())
@@ -306,8 +307,9 @@ def canonicalise(frame: pd.DataFrame) -> CanonicalisationResult:
             CanonicalisationAnomaly(
                 "SOURCE_EXACT_DUPLICATE_ROWS",
                 AnomalySeverity.WARNING,
-                f"{exact_duplicate_row_count} row(s) are byte-identical repeats "
-                "of an earlier row. Not removed here.",
+                f"{exact_duplicate_row_count} row(s) are equal to an earlier "
+                "row's values as received (before any type conversion). "
+                "Not removed here.",
             )
         )
 
@@ -315,7 +317,18 @@ def canonicalise(frame: pd.DataFrame) -> CanonicalisationResult:
     if ts_dup_mask.any():
         conflicting = False
         for _, group in out.loc[ts_dup_mask].groupby(TS):
-            if int(group.duplicated(keep=False).sum()) < len(group):
+            # Correct rule: how many DISTINCT observations share this
+            # timestamp? More than one is a conflict, regardless of how many
+            # copies of each exist. The previous check --
+            # "duplicated(keep=False).sum() < len(group)" -- was wrong
+            # whenever every row had SOME matching partner, e.g. two copies of
+            # A plus two copies of B (A,A,B,B): every row is "duplicated" by
+            # its own twin, sum()==len(group)==4, and the old check concluded
+            # "no conflict" despite two distinct observations being present.
+            distinct_observations = len(group) - int(
+                group.duplicated(keep="first").sum()
+            )
+            if distinct_observations > 1:
                 conflicting = True
                 break
         if conflicting:
@@ -323,11 +336,27 @@ def canonicalise(frame: pd.DataFrame) -> CanonicalisationResult:
                 CanonicalisationAnomaly(
                     "SOURCE_CONFLICTING_TIMESTAMPS",
                     AnomalySeverity.BLOCKER,
-                    "Two or more rows share a timestamp but disagree on OHLCV "
-                    "values. Canonicalisation does not choose between "
-                    "contradictory observations; both are preserved.",
+                    "Two or more DISTINCT observations share a timestamp. "
+                    "Canonicalisation does not choose between contradictory "
+                    "observations; all are preserved.",
                 )
             )
+    # --- end SOURCE-level evidence ----------------------------------------
+
+    if str(out[TS].dtype.tz) != IST_NAME:
+        source_tz = out[TS].dtype.tz
+        out[TS] = out[TS].dt.tz_convert(IST_NAME)
+        transformations.append(
+            CanonicalisationTransformation(
+                "TIMEZONE_CONVERTED",
+                f"Converted timestamps from {source_tz} to {IST_NAME}, "
+                "preserving the instant.",
+            )
+        )
+
+    for col in PRICE_COLUMNS:
+        out[col] = _to_numeric_strict(out[col], col).astype("float64")
+    out[VOLUME] = _to_whole_number_strict(out[VOLUME], VOLUME)
 
     if not timestamps_sorted:
         transformations.append(
@@ -367,6 +396,15 @@ def canonicalise_fyers_candles(candles: list[list]) -> CanonicalisationResult:
     positional field has no safe interpretation and is never invented as a
     synthetic column (e.g. ``x_unknown_7``) -- see the frozen architecture,
     section 15.
+
+    ``SourceEvidence.column_inventory`` for this function is always
+    ``OHLCV_COLUMNS``, for empty and non-empty payloads alike. This is
+    deliberate, not an oversight: a raw FYERS row is a bare positional array
+    with no field names at all, so "ts", "open", etc. are never columns
+    physically present in the source -- they are the fixed mapping THIS
+    ADAPTER imposes on every position-0..5 payload it accepts, independent of
+    how many rows arrive. An empty list did not "have" these columns any more
+    than a populated one did, since neither ever carried labels.
     """
     if not candles:
         return CanonicalisationResult(
@@ -394,7 +432,26 @@ def canonicalise_fyers_candles(candles: list[list]) -> CanonicalisationResult:
 
     frame = pd.DataFrame(candles, columns=list(OHLCV_COLUMNS))
     frame[TS] = epoch_series_to_ist(frame[TS])
-    return canonicalise(frame)
+
+    result = canonicalise(frame)
+    # canonicalise() sees `frame[TS]` already tz-aware IST (epoch_series_to_ist
+    # converted it above), so its own TIMEZONE_CONVERTED check never fires and
+    # the epoch->IST conversion that DID happen would otherwise leave no
+    # transformation evidence at all. Recorded here, at the point where the
+    # conversion is actually known to have occurred.
+    epoch_transformation = CanonicalisationTransformation(
+        "FYERS_EPOCH_TO_IST",
+        "Interpreted the source 'ts' field as Unix epoch seconds (UTC by "
+        "definition), then converted through UTC to Asia/Kolkata, preserving "
+        "the instant. This is the FYERS positional-payload adapter contract "
+        "(ADAPTER-CONTRACT-VALID; not yet verified against a live response).",
+    )
+    return CanonicalisationResult(
+        frame=result.frame,
+        transformations=(epoch_transformation, *result.transformations),
+        source_anomalies=result.source_anomalies,
+        source=result.source,
+    )
 
 
 def from_fyers_candles(candles: list[list]) -> pd.DataFrame:

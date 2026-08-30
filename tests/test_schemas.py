@@ -178,10 +178,6 @@ def test_assert_canonical_rejects_wrong_column_order():
         assert_canonical(frame)
 
 
-def anomaly(result: CanonicalisationResult, code: str):
-    return next(a for a in result.source_anomalies if a.code == code)
-
-
 # =========================================================================
 # Unit 2 — canonicalisation contract and source evidence
 #
@@ -317,20 +313,127 @@ def test_exact_duplicate_rows_survive_and_are_recorded():
     assert anomaly(result, "SOURCE_EXACT_DUPLICATE_ROWS").severity is AnomalySeverity.WARNING
 
 
-def test_conflicting_timestamps_survive_and_are_flagged_blocking():
-    """Canonicalisation must not choose between contradictory observations."""
+def test_duplicate_evidence_is_not_described_as_byte_identical():
+    """pandas .duplicated() establishes value-equality, not byte-identity.
+
+    Regression: the anomaly description previously claimed rows were
+    'byte-identical', which is a stronger and inaccurate claim.
+    """
     frame = make_ohlcv(10)
-    conflicting = frame.iloc[[4]].copy()
-    conflicting[CLOSE] = conflicting[CLOSE] + 100.0
-    combined = pd.concat([frame, conflicting], ignore_index=True)
-    result = canonicalise(combined)
-    assert len(result.frame) == 11
-    assert set(result.frame.loc[result.frame[TS].duplicated(keep=False), CLOSE]) == {
-        frame[CLOSE].iloc[4],
-        frame[CLOSE].iloc[4] + 100.0,
-    }
+    doubled = pd.concat([frame, frame.iloc[[4]]], ignore_index=True)
+    result = canonicalise(doubled)
+    description = anomaly(result, "SOURCE_EXACT_DUPLICATE_ROWS").description
+    assert "byte-identical" not in description.lower()
+
+
+# --- source-level evidence must not be computed from converted values ----
+
+
+def test_source_evidence_reflects_source_representation_not_canonical_value():
+    """Load-bearing principle: SOURCE EVIDENCE != POST-CONVERSION EVIDENCE.
+
+    Two rows share a timestamp. Row 1's open is the int 1; row 2's open is the
+    string "1". As RECEIVED these are different representations -- not an
+    exact duplicate -- even though both parse to the identical canonical
+    float 1.0. Source-level conflict detection must see two distinct
+    observations (a conflict), not silently treat them as one, and the
+    canonical output must still show the converged numeric value.
+    """
+    base = make_ohlcv(1, seed=61).iloc[0]
+    row1 = base.copy()
+    row1[OPEN] = 1
+    row2 = base.copy()
+    row2[OPEN] = "1"
+    frame = pd.DataFrame([row1, row2]).reset_index(drop=True)
+    frame[OPEN] = frame[OPEN].astype(object)  # preserve the mixed source types
+
+    result = canonicalise(frame)
+    assert len(result.frame) == 2, "both observations must survive"
+    assert "SOURCE_CONFLICTING_TIMESTAMPS" in anomaly_codes(result), (
+        "int(1) and '1' differ as received; source-level equality must not "
+        "silently merge them into a duplicate"
+    )
+    assert "SOURCE_EXACT_DUPLICATE_ROWS" not in anomaly_codes(result)
+    # After canonical numeric conversion, both rows legitimately show 1.0 --
+    # that convergence is a fact about the CANONICAL frame, not the source.
+    assert result.frame[OPEN].tolist() == [1.0, 1.0]
+
+
+def _rows_sharing_one_timestamp(*close_values: float) -> pd.DataFrame:
+    """Build a frame where every row shares one timestamp.
+
+    Rows with equal ``close`` are the "same observation, repeated"; rows with
+    different ``close`` are "distinct observations at that timestamp". Every
+    other field is held constant so ``close`` alone determines row identity.
+    """
+    base = make_ohlcv(1, seed=53).iloc[0]
+    rows = []
+    for close in close_values:
+        row = base.copy()
+        row[CLOSE] = close
+        rows.append(row)
+    return pd.DataFrame(rows).reset_index(drop=True)
+
+
+# --- full conflict matrix (manager-specified cases A-F) ------------------
+#
+# Regression: the original algorithm compared
+#     group.duplicated(keep=False).sum() < len(group)
+# which is wrong whenever every row in the group has SOME matching partner,
+# even if there are two or more distinct partner-groups. Case D (A,A,B,B) is
+# the exact counterexample: every row is "duplicated" by its own twin, so the
+# old check saw sum()==len(group) and concluded "no conflict" -- reproduced
+# and confirmed against the unpatched implementation before this fix.
+#
+# The correct test is: how many DISTINCT observations share this timestamp?
+# More than one -> conflict, regardless of how many copies of each exist.
+
+
+def test_conflict_matrix_case_A_two_identical_is_duplicate_not_conflict():
+    result = canonicalise(_rows_sharing_one_timestamp(100.0, 100.0))
+    assert len(result.frame) == 2, "both rows must survive"
+    assert "SOURCE_EXACT_DUPLICATE_ROWS" in anomaly_codes(result)
+    assert "SOURCE_CONFLICTING_TIMESTAMPS" not in anomaly_codes(result)
+
+
+def test_conflict_matrix_case_B_two_distinct_is_conflict():
+    result = canonicalise(_rows_sharing_one_timestamp(100.0, 200.0))
+    assert len(result.frame) == 2
     assert "SOURCE_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
     assert anomaly(result, "SOURCE_CONFLICTING_TIMESTAMPS").severity is AnomalySeverity.BLOCKER
+
+
+def test_conflict_matrix_case_C_AAB_is_conflict():
+    result = canonicalise(_rows_sharing_one_timestamp(100.0, 100.0, 200.0))
+    assert len(result.frame) == 3
+    assert "SOURCE_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
+
+
+def test_conflict_matrix_case_D_AABB_is_conflict():
+    """THE regression case: every row has a matching twin, but two distinct
+    observations (100.0 and 200.0) share the timestamp."""
+    result = canonicalise(_rows_sharing_one_timestamp(100.0, 100.0, 200.0, 200.0))
+    assert len(result.frame) == 4, "all four rows must survive"
+    assert "SOURCE_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
+    assert anomaly(result, "SOURCE_CONFLICTING_TIMESTAMPS").severity is AnomalySeverity.BLOCKER
+
+
+def test_conflict_matrix_case_E_four_identical_is_duplicate_not_conflict():
+    result = canonicalise(_rows_sharing_one_timestamp(100.0, 100.0, 100.0, 100.0))
+    assert len(result.frame) == 4
+    assert "SOURCE_EXACT_DUPLICATE_ROWS" in anomaly_codes(result)
+    assert "SOURCE_CONFLICTING_TIMESTAMPS" not in anomaly_codes(result)
+
+
+def test_conflict_matrix_case_F_conflict_in_one_of_two_timestamp_groups():
+    """T1 has AA (no conflict); T2 has B,C (conflict). Overall: conflict."""
+    t1 = _rows_sharing_one_timestamp(100.0, 100.0)
+    t2 = _rows_sharing_one_timestamp(300.0, 400.0)
+    t2[TS] = t2[TS] + pd.Timedelta(minutes=1)
+    combined = pd.concat([t1, t2], ignore_index=True)
+    result = canonicalise(combined)
+    assert len(result.frame) == 4
+    assert "SOURCE_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
 
 
 def test_no_duplicate_anomaly_on_clean_input():
@@ -448,6 +551,71 @@ def test_fyers_unsorted_payload_records_the_anomaly():
     assert result.source.timestamps_sorted is False
     assert "SOURCE_UNSORTED" in anomaly_codes(result)
     assert result.frame[TS].is_monotonic_increasing
+
+
+def test_fyers_records_the_epoch_to_ist_transformation():
+    """Regression: by the time canonicalise() ran, ts was already IST, so the
+    epoch-seconds -> Asia/Kolkata conversion left no transformation evidence.
+    """
+    result = canonicalise_fyers_candles(candles_payload(3)["candles"])
+    codes = transformation_codes(result)
+    assert "FYERS_EPOCH_TO_IST" in codes
+    epoch_transform = next(
+        t for t in result.transformations if t.code == "FYERS_EPOCH_TO_IST"
+    )
+    assert "epoch" in epoch_transform.description.lower()
+    assert "Asia/Kolkata" in epoch_transform.description
+
+
+def test_fyers_epoch_transformation_and_unsorted_evidence_coexist():
+    """Both facts about the FYERS ingestion must be visible together: the raw
+    payload needed sorting, AND the adapter performed the epoch conversion."""
+    rows = candles_payload(4)["candles"]
+    rows[1], rows[3] = rows[3], rows[1]
+    result = canonicalise_fyers_candles(rows)
+    codes = transformation_codes(result)
+    assert "FYERS_EPOCH_TO_IST" in codes
+    assert "ROWS_SORTED" in codes
+    assert result.source.row_count == 4
+    assert len(result.frame) == 4, "no observations may be removed"
+
+
+def test_fyers_empty_payload_has_no_epoch_transformation():
+    """Nothing was actually converted, so no transformation is claimed."""
+    result = canonicalise_fyers_candles([])
+    assert transformation_codes(result) == set()
+
+
+def test_fyers_exact_duplicate_candle_is_a_duplicate_not_a_conflict():
+    row = candles_payload(1)["candles"][0]
+    result = canonicalise_fyers_candles([row, list(row)])
+    assert len(result.frame) == 2
+    assert "SOURCE_EXACT_DUPLICATE_ROWS" in anomaly_codes(result)
+    assert "SOURCE_CONFLICTING_TIMESTAMPS" not in anomaly_codes(result)
+
+
+def test_fyers_same_epoch_different_close_is_a_conflict_not_a_duplicate():
+    row_a = candles_payload(1)["candles"][0]
+    row_b = list(row_a)
+    row_b[4] = row_b[4] + 500.0  # same epoch (index 0), different close
+    result = canonicalise_fyers_candles([row_a, row_b])
+    assert len(result.frame) == 2, "both observations must survive"
+    assert "SOURCE_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
+    assert "SOURCE_EXACT_DUPLICATE_ROWS" not in anomaly_codes(result)
+
+
+def test_fyers_column_inventory_is_the_fixed_adapter_mapping():
+    """FYERS positional rows carry no field names at all -- 'ts', 'open', etc.
+    are the ADAPTER's fixed interpretation of position 0, 1, 2..., not names
+    physically present in the payload. This mapping is therefore constant
+    regardless of payload size, including an empty payload: an empty list did
+    not "have" these columns any more than a non-empty one did, since neither
+    ever carried column labels in the first place.
+    """
+    empty_result = canonicalise_fyers_candles([])
+    populated_result = canonicalise_fyers_candles(candles_payload(3)["candles"])
+    assert empty_result.source.column_inventory == OHLCV_COLUMNS
+    assert populated_result.source.column_inventory == OHLCV_COLUMNS
 
 
 # --- adversarial combinations --------------------------------------------
