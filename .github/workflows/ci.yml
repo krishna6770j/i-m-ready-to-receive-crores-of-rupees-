@@ -1,0 +1,120 @@
+name: CI
+
+# Phase 1 verification gate.
+#
+# This workflow reproduces the CURRENTLY DOCUMENTED installation process
+# exactly, including the manual `asyncio` uninstall step. That step is ugly on
+# purpose: fyers-apiv3 declares a dependency on the PyPI `asyncio` backport,
+# which shadows the standard-library module and cannot run on Python 3.12.
+# Hiding it here would make CI test a cleaner environment than the one a
+# developer actually gets. Fixing the dependency situation is a separate,
+# manager-approved unit.
+#
+# CI passing is NOT a substitute for manager review.
+
+on:
+  push:
+    branches:
+      - phase1-trust-hardening
+  # Filters the TARGET branch of a pull request. Our intended workflow is
+  # phase1-trust-hardening -> main, so the base is `main`.
+  pull_request:
+    branches:
+      - main
+
+# Read-only. This workflow never commits, pushes, uploads data, creates
+# releases, or modifies any branch.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify Phase 1 baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the commit under test
+        # actions/checkout v7.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # Full history is mandatory: tests/test_security.py runs real git
+          # commands (`git ls-files`, `git log --all`, `git check-ignore`) to
+          # prove .env was never committed in ANY revision. A shallow clone
+          # would let that assertion pass without examining real history.
+          fetch-depth: 0
+
+      - name: Install uv
+        # astral-sh/setup-uv v10.0.1
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+
+      - name: Install Python 3.12.14
+        # Pinned to the exact patch release requirements.txt was resolved on.
+        # Testing a different 3.12.x and calling the environment reproduced
+        # would be a false claim.
+        run: uv python install 3.12.14
+
+      - name: Create virtual environment
+        run: uv venv --python 3.12.14 .venv
+
+      - name: Install dependencies
+        run: uv pip install --python .venv/bin/python -r requirements.txt
+
+      - name: Remove the asyncio backport (documented repair step)
+        run: uv pip uninstall --python .venv/bin/python asyncio
+
+      - name: Assert the asyncio backport is absent
+        run: |
+          if uv pip show --python .venv/bin/python asyncio > /dev/null 2>&1; then
+            echo "FAIL: the PyPI 'asyncio' backport is still installed."
+            echo "It shadows the standard library module and cannot run on 3.12."
+            exit 1
+          fi
+          echo "OK: PyPI 'asyncio' backport is not installed."
+
+      - name: Assert asyncio resolves to the standard library
+        run: |
+          .venv/bin/python - <<'PY'
+          import asyncio, sys
+          path = asyncio.__file__ or ""
+          assert "site-packages" not in path, f"asyncio came from site-packages: {path}"
+          assert hasattr(asyncio, "run"), "stdlib asyncio is missing run()"
+          print(f"OK: asyncio resolved from {path}")
+          PY
+
+      - name: Import smoke check
+        # Confirms the SDK imports without the PyPI asyncio package present.
+        # No network call is made and no broker is contacted.
+        run: |
+          .venv/bin/python - <<'PY'
+          import asyncio, pandas, numpy, pyarrow
+          from fyers_apiv3 import fyersModel
+          print(f"pandas {pandas.__version__} numpy {numpy.__version__} pyarrow {pyarrow.__version__}")
+          print("fyers_apiv3 imported without the asyncio backport")
+          PY
+
+      - name: Security tests
+        # Run separately and BEFORE the full suite so a reviewer can see
+        # whether the security gate itself passed without reading the whole
+        # suite result. Deliberately redundant with the next step.
+        run: .venv/bin/python -m pytest tests/test_security.py -W error -q
+
+      - name: Full test suite
+        run: .venv/bin/python -m pytest -W error -q
+
+      - name: Compile check
+        # compileall exits 0 even on a SyntaxWarning, and the warning is
+        # written to stdout rather than stderr, so neither the exit code nor
+        # `-W error` gates it. Verified locally: a file containing
+        # `assert x is not 0` produces output but exit status 0. Under `-q`
+        # a clean tree produces no output at all, so any output is a failure.
+        run: |
+          set -o pipefail
+          OUTPUT=$(.venv/bin/python -m compileall -q \
+            brokers config core instruments marketdata scripts tests 2>&1)
+          if [ -n "$OUTPUT" ]; then
+            echo "FAIL: compileall reported problems:"
+            echo "$OUTPUT"
+            exit 1
+          fi
+          echo "OK: all sources compile with no warnings or errors."
