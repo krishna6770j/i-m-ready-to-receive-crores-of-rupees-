@@ -100,7 +100,7 @@ import re
 import struct
 import uuid
 from collections.abc import Mapping
-from dataclasses import fields as dataclass_fields, is_dataclass
+from dataclasses import dataclass, fields as dataclass_fields, is_dataclass
 from datetime import time as _time
 from enum import Enum
 from types import MappingProxyType
@@ -108,8 +108,14 @@ from typing import Any
 
 from core.environment import software_versions
 from marketdata.dataset import ValidatedDataset, ValidationPolicy
-from marketdata.evidence import FetchReportSnapshot
-from marketdata.schemas import MARKET_DATA_SCHEMA_VERSION
+from marketdata.evidence import ChunkResultSnapshot, FetchReportSnapshot
+from marketdata.schemas import (
+    MARKET_DATA_SCHEMA_VERSION,
+    AnomalySeverity,
+    CanonicalisationAnomaly,
+    CanonicalisationTransformation,
+    SourceEvidence,
+)
 
 # Frozen contract (section 8.0's sibling for provenance, section 6).
 # Versioned independently of MARKET_DATA_SCHEMA_VERSION -- acquisition
@@ -319,6 +325,58 @@ def _to_jsonable(value: Any) -> Any:
     )
 
 
+def _encode_provenance_fields(
+    *,
+    provenance_schema_version: int,
+    market_data_schema_version: int,
+    source: str,
+    symbol: str,
+    resolution: str,
+    generation_id: uuid.UUID,
+    namespace: "Namespace",
+    transformations: tuple,
+    source_anomalies: tuple,
+    source_evidence: SourceEvidence,
+    validation_policy: ValidationPolicy,
+    fetch: FetchReportSnapshot | None,
+    forced: bool,
+    force_reason: str | None,
+    software: MappingProxyType,
+) -> bytes:
+    """The exact byte stream a provenance envelope's ``provenance_digest``
+    hashes -- shared between ``ProvenanceEnvelope._encode_envelope`` (build
+    time, live values) and ``ReconstructedManifest.recompute_provenance_digest``
+    (read time, values reconstructed from a persisted manifest). A single
+    encoding path means the reader can never silently drift from what
+    ``build()`` actually hashed.
+
+    Deliberately excludes ``data_digest`` -- see the module docstring's
+    "DATA identity vs PROVENANCE identity" note.
+    """
+    ordered_fields = (
+        ("provenance_schema_version", provenance_schema_version),
+        ("market_data_schema_version", market_data_schema_version),
+        ("source", source),
+        ("symbol", symbol),
+        ("resolution", resolution),
+        ("generation_id", generation_id),
+        ("namespace", namespace),
+        ("transformations", transformations),
+        ("source_anomalies", source_anomalies),
+        ("source_evidence", source_evidence),
+        ("validation_policy", validation_policy),
+        ("fetch", fetch),
+        ("forced", forced),
+        ("force_reason", force_reason),
+        ("software", software),
+    )
+    parts = [_encode_i64(len(ordered_fields))]
+    for name, value in ordered_fields:
+        parts.append(_encode_str(name))
+        parts.append(_encode_value(value))
+    return b"".join(parts)
+
+
 class ProvenanceEnvelope:
     """Immutable provenance envelope bound to one ``ValidatedDataset``.
 
@@ -502,28 +560,23 @@ class ProvenanceEnvelope:
         ``build()``), so tampering with it is still detected; it just no
         longer changes ``provenance_digest`` itself.
         """
-        ordered_fields = (
-            ("provenance_schema_version", self._provenance_schema_version),
-            ("market_data_schema_version", self._market_data_schema_version),
-            ("source", self._source),
-            ("symbol", self._symbol),
-            ("resolution", self._resolution),
-            ("generation_id", self._generation_id),
-            ("namespace", self._namespace),
-            ("transformations", self._transformations),
-            ("source_anomalies", self._source_anomalies),
-            ("source_evidence", self._source_evidence),
-            ("validation_policy", self._validation_policy),
-            ("fetch", self._fetch),
-            ("forced", self._forced),
-            ("force_reason", self._force_reason),
-            ("software", self._software),
+        return _encode_provenance_fields(
+            provenance_schema_version=self._provenance_schema_version,
+            market_data_schema_version=self._market_data_schema_version,
+            source=self._source,
+            symbol=self._symbol,
+            resolution=self._resolution,
+            generation_id=self._generation_id,
+            namespace=self._namespace,
+            transformations=self._transformations,
+            source_anomalies=self._source_anomalies,
+            source_evidence=self._source_evidence,
+            validation_policy=self._validation_policy,
+            fetch=self._fetch,
+            forced=self._forced,
+            force_reason=self._force_reason,
+            software=self._software,
         )
-        parts = [_encode_i64(len(ordered_fields))]
-        for name, value in ordered_fields:
-            parts.append(_encode_str(name))
-            parts.append(_encode_value(value))
-        return b"".join(parts)
 
     # -- public, read-only surface -----------------------------------------
 
@@ -640,3 +693,485 @@ class ProvenanceEnvelope:
         separators, deterministic for a fixed envelope.
         """
         return json.dumps(self.to_manifest_dict(), sort_keys=True, separators=(",", ":"))
+
+
+# ---------------------------------------------------------------------------
+# Strict manifest reconstruction (frozen architecture section 12: read_trusted
+# needs to reconstruct and re-verify a persisted manifest, not merely
+# serialise one).
+#
+# ``ReconstructedManifest.from_manifest_json()`` performs STRUCTURAL
+# validation only -- malformed JSON, duplicate keys (at any nesting level),
+# unknown/missing fields, and wrong field types are all rejected, and every
+# nested evidence shape (transformations, source_anomalies, source_evidence,
+# ValidationPolicy, FetchReportSnapshot/ChunkResultSnapshot) is reconstructed
+# into the exact same immutable types ``ProvenanceEnvelope`` bound at build
+# time. It deliberately does NOT compare the manifest's own
+# ``provenance_digest``/``integrity_id`` fields against a recomputation --
+# that is a TRUST decision belonging to the caller
+# (``marketdata.trusted_reader``), via ``recompute_provenance_digest()``/
+# ``recompute_integrity_id()``. Separating the two means a forensic/
+# unverified read can still inspect a manifest whose stored digests do not
+# match its own contents, instead of being unable to parse it at all.
+# ---------------------------------------------------------------------------
+
+
+class ManifestError(ValueError):
+    """Raised when a persisted manifest is malformed or internally
+    inconsistent (wrong shape, unknown/missing field, wrong type) -- never
+    raised for a digest MISMATCH, which is a trust judgement the caller
+    makes via :meth:`ReconstructedManifest.recompute_provenance_digest` /
+    :meth:`ReconstructedManifest.recompute_integrity_id`.
+    """
+
+
+_MANIFEST_FIELDS = frozenset(
+    {
+        "provenance_schema_version",
+        "market_data_schema_version",
+        "source",
+        "symbol",
+        "resolution",
+        "generation_id",
+        "namespace",
+        "data_digest",
+        "transformations",
+        "source_anomalies",
+        "source_evidence",
+        "validation_policy",
+        "fetch",
+        "forced",
+        "force_reason",
+        "software",
+        "provenance_digest",
+        "integrity_id",
+    }
+)
+_TRANSFORMATION_FIELDS = frozenset({"code", "description"})
+_ANOMALY_FIELDS = frozenset({"code", "severity", "description"})
+_SOURCE_EVIDENCE_FIELDS = frozenset(
+    {
+        "row_count",
+        "column_inventory",
+        "timestamps_sorted",
+        "descending_adjacent_pairs",
+        "exact_duplicate_row_count",
+        "duplicate_timestamp_row_count",
+    }
+)
+_VALIDATION_POLICY_FIELDS = frozenset(
+    {"expected_interval_minutes", "sigma_threshold", "session_window", "max_session_gap_days"}
+)
+_CHUNK_FIELDS = frozenset({"range_from", "range_to", "rows", "ok", "error"})
+_FETCH_FIELDS = frozenset(
+    {
+        "symbol",
+        "resolution",
+        "requested_from",
+        "requested_to",
+        "chunks",
+        "total_rows",
+        "first_ts",
+        "last_ts",
+        "duplicate_rows_removed",
+        "conflicting_timestamps",
+    }
+)
+
+
+def _manifest_require_sha256_hex(value: object, field_name: str) -> str:
+    try:
+        return _validate_sha256_hex(value, field_name)
+    except ValueError as exc:
+        raise ManifestError(str(exc)) from exc
+
+
+def _reject_duplicate_manifest_keys(pairs: list) -> dict:
+    """``object_pairs_hook`` for ``json.loads``: raises on any repeated key
+    at any object level (applied recursively by ``json.loads`` to every
+    nested object -- transformations, anomalies, source_evidence,
+    validation_policy, fetch, and each fetch chunk), instead of ``dict()``'s
+    default silent last-value-wins behaviour.
+    """
+    seen: set[str] = set()
+    result: dict = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ManifestError(f"manifest JSON has a duplicate key: {key!r}")
+        seen.add(key)
+        result[key] = value
+    return result
+
+
+def _manifest_require_exact_keys(payload: object, required: frozenset, label: str) -> dict:
+    if type(payload) is not dict:
+        raise ManifestError(f"{label} must be a JSON object, got {type(payload).__name__}")
+    actual = set(payload.keys())
+    unknown = actual - required
+    missing = required - actual
+    if unknown:
+        raise ManifestError(f"{label} has unknown field(s): {sorted(unknown)}")
+    if missing:
+        raise ManifestError(f"{label} is missing field(s): {sorted(missing)}")
+    return payload
+
+
+def _manifest_require_type(value: object, expected_type: type, field_name: str):
+    if type(value) is not expected_type:
+        raise ManifestError(
+            f"manifest field {field_name!r} must be {expected_type.__name__}, got "
+            f"{value!r} ({type(value).__name__})"
+        )
+    return value
+
+
+def _manifest_require_nonneg_int(value: object, field_name: str) -> int:
+    _manifest_require_type(value, int, field_name)
+    if value < 0:
+        raise ManifestError(f"manifest field {field_name!r} must be >= 0, got {value}")
+    return value
+
+
+def _manifest_require_str_or_none(value: object, field_name: str):
+    if value is not None and type(value) is not str:
+        raise ManifestError(
+            f"manifest field {field_name!r} must be str or null, got "
+            f"{value!r} ({type(value).__name__})"
+        )
+    return value
+
+
+def _parse_transformation(payload: object, index: int) -> CanonicalisationTransformation:
+    payload = _manifest_require_exact_keys(payload, _TRANSFORMATION_FIELDS, f"transformations[{index}]")
+    code = _manifest_require_type(payload["code"], str, f"transformations[{index}].code")
+    description = _manifest_require_type(
+        payload["description"], str, f"transformations[{index}].description"
+    )
+    return CanonicalisationTransformation(code=code, description=description)
+
+
+def _parse_anomaly(payload: object, index: int) -> CanonicalisationAnomaly:
+    payload = _manifest_require_exact_keys(payload, _ANOMALY_FIELDS, f"source_anomalies[{index}]")
+    code = _manifest_require_type(payload["code"], str, f"source_anomalies[{index}].code")
+    severity_raw = payload["severity"]
+    valid_severities = {s.value for s in AnomalySeverity}
+    if type(severity_raw) is not str or severity_raw not in valid_severities:
+        raise ManifestError(
+            f"source_anomalies[{index}].severity must be one of "
+            f"{sorted(valid_severities)}, got {severity_raw!r}"
+        )
+    description = _manifest_require_type(
+        payload["description"], str, f"source_anomalies[{index}].description"
+    )
+    return CanonicalisationAnomaly(code=code, severity=AnomalySeverity(severity_raw), description=description)
+
+
+def _parse_source_evidence(payload: object) -> SourceEvidence:
+    payload = _manifest_require_exact_keys(payload, _SOURCE_EVIDENCE_FIELDS, "source_evidence")
+    row_count = _manifest_require_nonneg_int(payload["row_count"], "source_evidence.row_count")
+    column_inventory_raw = payload["column_inventory"]
+    if type(column_inventory_raw) is not list or not all(type(c) is str for c in column_inventory_raw):
+        raise ManifestError("source_evidence.column_inventory must be a list of str")
+    timestamps_sorted = _manifest_require_type(
+        payload["timestamps_sorted"], bool, "source_evidence.timestamps_sorted"
+    )
+    descending = _manifest_require_nonneg_int(
+        payload["descending_adjacent_pairs"], "source_evidence.descending_adjacent_pairs"
+    )
+    exact_dupes = _manifest_require_nonneg_int(
+        payload["exact_duplicate_row_count"], "source_evidence.exact_duplicate_row_count"
+    )
+    ts_dupes = _manifest_require_nonneg_int(
+        payload["duplicate_timestamp_row_count"], "source_evidence.duplicate_timestamp_row_count"
+    )
+    return SourceEvidence(
+        row_count=row_count,
+        column_inventory=tuple(column_inventory_raw),
+        timestamps_sorted=timestamps_sorted,
+        descending_adjacent_pairs=descending,
+        exact_duplicate_row_count=exact_dupes,
+        duplicate_timestamp_row_count=ts_dupes,
+    )
+
+
+def _parse_validation_policy(payload: object) -> ValidationPolicy:
+    payload = _manifest_require_exact_keys(payload, _VALIDATION_POLICY_FIELDS, "validation_policy")
+
+    expected_interval = payload["expected_interval_minutes"]
+    if expected_interval is not None:
+        _manifest_require_type(expected_interval, int, "validation_policy.expected_interval_minutes")
+
+    sigma = payload["sigma_threshold"]
+    if type(sigma) not in (int, float):
+        raise ManifestError(
+            f"validation_policy.sigma_threshold must be a number, got {sigma!r} "
+            f"({type(sigma).__name__})"
+        )
+
+    session_window_raw = payload["session_window"]
+    session_window = None
+    if session_window_raw is not None:
+        if (
+            type(session_window_raw) is not list
+            or len(session_window_raw) != 2
+            or not all(type(t) is str for t in session_window_raw)
+        ):
+            raise ManifestError(
+                "validation_policy.session_window must be null or a list of "
+                f"exactly two ISO time strings, got {session_window_raw!r}"
+            )
+        try:
+            session_window = tuple(_time.fromisoformat(t) for t in session_window_raw)
+        except ValueError as exc:
+            raise ManifestError(
+                f"validation_policy.session_window contains an invalid ISO time: {exc}"
+            ) from exc
+
+    max_gap = payload["max_session_gap_days"]
+    if max_gap is not None and type(max_gap) not in (int, float):
+        raise ManifestError(
+            f"validation_policy.max_session_gap_days must be null or a number, "
+            f"got {max_gap!r} ({type(max_gap).__name__})"
+        )
+
+    # ValidationPolicy.__post_init__ performs its own type/bounds validation
+    # and normalisation (int/float coercion, positivity, session_window
+    # re-tupling) -- reused here rather than duplicated.
+    return ValidationPolicy(
+        expected_interval_minutes=expected_interval,
+        sigma_threshold=sigma,
+        session_window=session_window,
+        max_session_gap_days=max_gap,
+    )
+
+
+def _parse_chunk(payload: object, index: int) -> ChunkResultSnapshot:
+    payload = _manifest_require_exact_keys(payload, _CHUNK_FIELDS, f"fetch.chunks[{index}]")
+    range_from = _manifest_require_type(payload["range_from"], str, f"fetch.chunks[{index}].range_from")
+    range_to = _manifest_require_type(payload["range_to"], str, f"fetch.chunks[{index}].range_to")
+    rows = _manifest_require_nonneg_int(payload["rows"], f"fetch.chunks[{index}].rows")
+    ok = _manifest_require_type(payload["ok"], bool, f"fetch.chunks[{index}].ok")
+    error = _manifest_require_str_or_none(payload["error"], f"fetch.chunks[{index}].error")
+    return ChunkResultSnapshot(range_from=range_from, range_to=range_to, rows=rows, ok=ok, error=error)
+
+
+def _parse_fetch(payload: object) -> FetchReportSnapshot:
+    payload = _manifest_require_exact_keys(payload, _FETCH_FIELDS, "fetch")
+    symbol = _manifest_require_type(payload["symbol"], str, "fetch.symbol")
+    resolution = _manifest_require_type(payload["resolution"], str, "fetch.resolution")
+    requested_from = _manifest_require_type(payload["requested_from"], str, "fetch.requested_from")
+    requested_to = _manifest_require_type(payload["requested_to"], str, "fetch.requested_to")
+
+    chunks_raw = payload["chunks"]
+    if type(chunks_raw) is not list:
+        raise ManifestError("fetch.chunks must be a list")
+    chunks = tuple(_parse_chunk(c, i) for i, c in enumerate(chunks_raw))
+
+    total_rows = _manifest_require_nonneg_int(payload["total_rows"], "fetch.total_rows")
+    first_ts = _manifest_require_str_or_none(payload["first_ts"], "fetch.first_ts")
+    last_ts = _manifest_require_str_or_none(payload["last_ts"], "fetch.last_ts")
+    dup_removed = _manifest_require_nonneg_int(
+        payload["duplicate_rows_removed"], "fetch.duplicate_rows_removed"
+    )
+    conflicting = _manifest_require_nonneg_int(
+        payload["conflicting_timestamps"], "fetch.conflicting_timestamps"
+    )
+    return FetchReportSnapshot(
+        symbol=symbol,
+        resolution=resolution,
+        requested_from=requested_from,
+        requested_to=requested_to,
+        chunks=chunks,
+        total_rows=total_rows,
+        first_ts=first_ts,
+        last_ts=last_ts,
+        duplicate_rows_removed=dup_removed,
+        conflicting_timestamps=conflicting,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ReconstructedManifest:
+    """A persisted generation manifest, strictly re-parsed and reconstructed
+    into the exact same immutable evidence types ``ProvenanceEnvelope`` bound
+    at build time. See the module section header above for what
+    :meth:`from_manifest_json` does and does not check.
+    """
+
+    provenance_schema_version: int
+    market_data_schema_version: int
+    source: str
+    symbol: str
+    resolution: str
+    generation_id: uuid.UUID
+    namespace: Namespace
+    data_digest: str
+    transformations: tuple
+    source_anomalies: tuple
+    source_evidence: SourceEvidence
+    validation_policy: ValidationPolicy
+    fetch: FetchReportSnapshot | None
+    forced: bool
+    force_reason: str | None
+    software: MappingProxyType
+    provenance_digest: str
+    integrity_id: str
+
+    def recompute_provenance_digest(self) -> str:
+        """Recomputed using the SOFTWARE VALUES STORED in this manifest
+        (``self.software``), never the live process environment --
+        ``ProvenanceEnvelope.build()`` captures the CURRENT environment,
+        which would be the wrong thing to hash when re-verifying an
+        already-persisted manifest.
+        """
+        encoded = _encode_provenance_fields(
+            provenance_schema_version=self.provenance_schema_version,
+            market_data_schema_version=self.market_data_schema_version,
+            source=self.source,
+            symbol=self.symbol,
+            resolution=self.resolution,
+            generation_id=self.generation_id,
+            namespace=self.namespace,
+            transformations=self.transformations,
+            source_anomalies=self.source_anomalies,
+            source_evidence=self.source_evidence,
+            validation_policy=self.validation_policy,
+            fetch=self.fetch,
+            forced=self.forced,
+            force_reason=self.force_reason,
+            software=self.software,
+        )
+        return hashlib.sha256(encoded).hexdigest()
+
+    def recompute_integrity_id(self) -> str:
+        """``SHA256(data_digest || recompute_provenance_digest())`` -- uses
+        ``self.data_digest`` (the manifest's OWN stored field) combined with
+        the FRESHLY recomputed provenance digest, never the manifest's own
+        stored ``provenance_digest``.
+        """
+        provenance_digest = self.recompute_provenance_digest()
+        return hashlib.sha256(
+            bytes.fromhex(self.data_digest) + bytes.fromhex(provenance_digest)
+        ).hexdigest()
+
+    @classmethod
+    def from_manifest_json(cls, text: str) -> "ReconstructedManifest":
+        """Strict structural parse. Raises ``ManifestError`` for: malformed
+        JSON; a duplicate key at any nesting level; any unknown or missing
+        field (top-level or nested); a wrong ``provenance_schema_version``/
+        ``market_data_schema_version``; any wrong field type (bools are
+        never accepted where an int is required, and vice versa); a
+        malformed UUID/namespace/digest.
+
+        Does NOT compare ``provenance_digest``/``integrity_id`` against a
+        recomputation -- see :meth:`recompute_provenance_digest`.
+        """
+        try:
+            payload = json.loads(text, object_pairs_hook=_reject_duplicate_manifest_keys)
+        except json.JSONDecodeError as exc:
+            raise ManifestError(f"manifest is not valid JSON: {exc}") from exc
+
+        payload = _manifest_require_exact_keys(payload, _MANIFEST_FIELDS, "manifest")
+
+        provenance_schema_version = payload["provenance_schema_version"]
+        if (
+            type(provenance_schema_version) is not int
+            or provenance_schema_version != PROVENANCE_SCHEMA_VERSION
+        ):
+            raise ManifestError(
+                "manifest.provenance_schema_version must be exactly "
+                f"{PROVENANCE_SCHEMA_VERSION} (as an int), got {provenance_schema_version!r}"
+            )
+        market_data_schema_version = payload["market_data_schema_version"]
+        if (
+            type(market_data_schema_version) is not int
+            or market_data_schema_version != MARKET_DATA_SCHEMA_VERSION
+        ):
+            raise ManifestError(
+                "manifest.market_data_schema_version must be exactly "
+                f"{MARKET_DATA_SCHEMA_VERSION} (as an int), got {market_data_schema_version!r}"
+            )
+
+        source = _manifest_require_type(payload["source"], str, "source")
+        symbol = _manifest_require_type(payload["symbol"], str, "symbol")
+        resolution = _manifest_require_type(payload["resolution"], str, "resolution")
+
+        generation_id_raw = payload["generation_id"]
+        if type(generation_id_raw) is not str:
+            raise ManifestError(
+                f"manifest.generation_id must be a str, got {type(generation_id_raw).__name__}"
+            )
+        try:
+            generation_id = uuid.UUID(generation_id_raw)
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ManifestError(
+                f"manifest.generation_id must be a valid UUID, got {generation_id_raw!r}"
+            ) from exc
+        if generation_id.version != 4:
+            raise ManifestError(
+                f"manifest.generation_id must be a version-4 UUID, got version "
+                f"{generation_id.version} ({generation_id})"
+            )
+
+        namespace_raw = payload["namespace"]
+        valid_namespaces = {n.value for n in Namespace}
+        if type(namespace_raw) is not str or namespace_raw not in valid_namespaces:
+            raise ManifestError(
+                f"manifest.namespace must be one of {sorted(valid_namespaces)}, "
+                f"got {namespace_raw!r}"
+            )
+        namespace = Namespace(namespace_raw)
+
+        data_digest = _manifest_require_sha256_hex(payload["data_digest"], "manifest.data_digest")
+
+        transformations_raw = payload["transformations"]
+        if type(transformations_raw) is not list:
+            raise ManifestError("manifest.transformations must be a list")
+        transformations = tuple(
+            _parse_transformation(t, i) for i, t in enumerate(transformations_raw)
+        )
+
+        anomalies_raw = payload["source_anomalies"]
+        if type(anomalies_raw) is not list:
+            raise ManifestError("manifest.source_anomalies must be a list")
+        source_anomalies = tuple(_parse_anomaly(a, i) for i, a in enumerate(anomalies_raw))
+
+        source_evidence = _parse_source_evidence(payload["source_evidence"])
+        validation_policy = _parse_validation_policy(payload["validation_policy"])
+
+        fetch_raw = payload["fetch"]
+        fetch = None if fetch_raw is None else _parse_fetch(fetch_raw)
+
+        forced = _manifest_require_type(payload["forced"], bool, "forced")
+        force_reason = _manifest_require_str_or_none(payload["force_reason"], "force_reason")
+
+        software_raw = payload["software"]
+        if type(software_raw) is not dict or not all(
+            type(k) is str and type(v) is str for k, v in software_raw.items()
+        ):
+            raise ManifestError("manifest.software must be an object of str -> str")
+        software = MappingProxyType(dict(software_raw))
+
+        provenance_digest = _manifest_require_sha256_hex(payload["provenance_digest"], "manifest.provenance_digest")
+        integrity_id = _manifest_require_sha256_hex(payload["integrity_id"], "manifest.integrity_id")
+
+        return cls(
+            provenance_schema_version=provenance_schema_version,
+            market_data_schema_version=market_data_schema_version,
+            source=source,
+            symbol=symbol,
+            resolution=resolution,
+            generation_id=generation_id,
+            namespace=namespace,
+            data_digest=data_digest,
+            transformations=transformations,
+            source_anomalies=source_anomalies,
+            source_evidence=source_evidence,
+            validation_policy=validation_policy,
+            fetch=fetch,
+            forced=forced,
+            force_reason=force_reason,
+            software=software,
+            provenance_digest=provenance_digest,
+            integrity_id=integrity_id,
+        )

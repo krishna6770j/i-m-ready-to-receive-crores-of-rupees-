@@ -576,3 +576,180 @@ def test_software_mapping_is_read_only():
     env = ProvenanceEnvelope.build(_dataset())
     with pytest.raises(TypeError):
         env.software["python"] = "corrupted"
+
+
+# ---------------------------------------------------------------------------
+# ReconstructedManifest (Unit 10: strict manifest reconstruction/reverification)
+# ---------------------------------------------------------------------------
+
+import json
+
+from marketdata.provenance import ManifestError, ReconstructedManifest
+
+
+def _envelope_and_json(**dataset_kwargs):
+    ds = _dataset(**dataset_kwargs)
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_snapshot())
+    return env, env.to_manifest_json()
+
+
+def test_reconstructed_manifest_round_trips_and_digests_match():
+    env, manifest_json = _envelope_and_json()
+    rm = ReconstructedManifest.from_manifest_json(manifest_json)
+    assert rm.recompute_provenance_digest() == env.provenance_digest
+    assert rm.recompute_integrity_id() == env.integrity_id
+    assert rm.data_digest == env.data_digest
+    assert rm.generation_id == env.generation_id
+    assert rm.namespace == env.namespace
+    assert rm.validation_policy == env.validation_policy
+    assert rm.fetch == env.fetch
+    assert rm.transformations == env.transformations
+    assert rm.source_anomalies == env.source_anomalies
+    assert rm.source_evidence == env.source_evidence
+    assert dict(rm.software) == dict(env.software)
+
+
+def test_reconstructed_manifest_no_fetch():
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds)
+    rm = ReconstructedManifest.from_manifest_json(env.to_manifest_json())
+    assert rm.fetch is None
+    assert rm.recompute_provenance_digest() == env.provenance_digest
+
+
+def test_malformed_json_rejected():
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json("{not valid json")
+
+
+def test_top_level_duplicate_key_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    raw = manifest_json.rstrip("}")
+    # Inject a duplicate of an existing key with a different value.
+    tampered = raw + f',"forced":{str(not payload["forced"]).lower()}}}'
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(tampered)
+
+
+def test_nested_duplicate_key_rejected():
+    # Inject a duplicate key inside the nested "source_evidence" object,
+    # via direct string surgery (json.dumps can never itself produce a
+    # duplicate key, so this simulates a hand-tampered/corrupted file).
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    se_json = json.dumps(payload["source_evidence"], sort_keys=True)
+    duplicated_se_json = se_json[:-1] + ',"row_count":999}'
+    outer_json = json.dumps(payload, sort_keys=True)
+    injected = outer_json.replace(se_json, duplicated_se_json, 1)
+    assert injected != outer_json  # sanity: the replacement actually happened
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(injected)
+
+
+def test_unknown_top_level_field_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["unexpected_field"] = "x"
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_missing_top_level_field_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    del payload["forced"]
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_wrong_provenance_schema_version_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["provenance_schema_version"] = 2
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_wrong_market_data_schema_version_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["market_data_schema_version"] = 2
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_bool_provenance_schema_version_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["provenance_schema_version"] = True
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_generation_id_not_uuid4_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["generation_id"] = str(uuid.uuid1())
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_namespace_invalid_value_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["namespace"] = "SOMETHING_ELSE"
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_forced_as_int_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["forced"] = 0
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_data_digest_not_hex_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["data_digest"] = "not-a-digest"
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_edited_provenance_fact_changes_recomputed_digest():
+    env, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["source_evidence"]["row_count"] = 999
+    tampered_json = json.dumps(payload)
+    rm = ReconstructedManifest.from_manifest_json(tampered_json)
+    # Structural parse succeeds (forensic inspection remains possible), but
+    # the recomputed digest no longer matches the manifest's own stored claim.
+    assert rm.recompute_provenance_digest() != payload["provenance_digest"]
+
+
+def test_edited_provenance_digest_field_detected_by_recompute():
+    env, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["provenance_digest"] = "0" * 64
+    tampered_json = json.dumps(payload)
+    rm = ReconstructedManifest.from_manifest_json(tampered_json)
+    assert rm.recompute_provenance_digest() != rm.provenance_digest
+
+
+def test_missing_chunk_field_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    del payload["fetch"]["chunks"][0]["error"]
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_chunk_ok_as_int_rejected_by_manifest_parser():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["fetch"]["chunks"][0]["ok"] = 1
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
