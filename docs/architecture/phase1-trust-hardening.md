@@ -253,10 +253,47 @@ detected: the envelope still names its birth location, which no longer matches.
 
 ## 8. Canonical encoding and dataset identity
 
+### 8.0 Schema version numbers — frozen
+
+```
+MARKET_DATA_SCHEMA_VERSION = 1
+PROVENANCE_SCHEMA_VERSION  = 1
+```
+
+**`MARKET_DATA_SCHEMA_VERSION = 1`** identifies the currently frozen canonical
+market-data representation defined in this document: the six-column canonical
+frame (`ts`, `open`, `high`, `low`, `close`, `volume`) with the canonical
+dtypes, timestamp semantics, missing-value semantics, and identity-defining
+field interpretation described throughout §8 and §14–15. It is one of the
+inputs to dataset identity (§8.1) and therefore to `data_digest`.
+
+A **new** `MARKET_DATA_SCHEMA_VERSION` is required whenever a change would
+alter what the canonical logical dataset *means* — for example: adding a
+canonical observation field; changing timestamp meaning; changing canonical
+numeric representation; changing missing-value semantics; changing the
+interpretation of any identity-defining field.
+
+A new version is **not** required for: implementation refactors; added tests;
+performance changes; or storage-layout changes that do not alter logical
+dataset identity.
+
+**`PROVENANCE_SCHEMA_VERSION = 1`** identifies the first provenance-envelope
+structure described in §6, independently of the market-data schema version —
+acquisition/provenance fields are expected to evolve on their own timeline
+while the candle schema stays stable. No provenance envelope implementation
+is authorised by this section; this freezes the version number contract only,
+ahead of that future unit.
+
+Callers never choose or invent either version number. Both are fixed
+constants defined once by this document (and mirrored as code constants where
+each is implemented) and are never parameters.
+
 ### 8.1 Identity
 
 > **(schema_version, source, symbol, resolution, canonical observation sequence
 > including preserved named extra columns)**
+
+`schema_version` here is `MARKET_DATA_SCHEMA_VERSION`, defined in §8.0.
 
 In identity: schema version, source/vendor, symbol, resolution, canonical
 observation columns, preserved named extra columns, timestamp instant, row

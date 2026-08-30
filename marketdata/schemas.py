@@ -65,6 +65,13 @@ from core.timeutils import IST_NAME, epoch_series_to_ist
 # value -- see _convert_numeric_exact().
 _MAX_EXACT_FLOAT64_INT = 2**53
 
+# Frozen contract (docs/architecture/phase1-trust-hardening.md, section 8.0).
+# Identifies the canonical market-data representation below. A new value is
+# required only when a change would alter what the canonical dataset means
+# (new field, changed timestamp/numeric/missing-value semantics) -- never for
+# refactors, tests, or storage changes. Never a caller-supplied parameter.
+MARKET_DATA_SCHEMA_VERSION = 1
+
 TS = "ts"
 OPEN = "open"
 HIGH = "high"

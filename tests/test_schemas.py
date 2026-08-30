@@ -10,6 +10,7 @@ from marketdata.schemas import (
     CLOSE,
     HIGH,
     LOW,
+    MARKET_DATA_SCHEMA_VERSION,
     OHLCV_COLUMNS,
     OPEN,
     TS,
@@ -40,6 +41,14 @@ def transformation_codes(result: CanonicalisationResult) -> set[str]:
 
 def anomaly(result: CanonicalisationResult, code: str):
     return next(a for a in result.source_anomalies if a.code == code)
+
+
+def test_market_data_schema_version_is_frozen_at_1():
+    # docs/architecture/phase1-trust-hardening.md section 8.0: this is a
+    # frozen contract number, not free to drift. A change here must be
+    # accompanied by a deliberate architecture-document amendment, not an
+    # accidental edit.
+    assert MARKET_DATA_SCHEMA_VERSION == 1
 
 
 def test_empty_frame_has_correct_dtypes():
