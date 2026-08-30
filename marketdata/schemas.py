@@ -49,13 +49,21 @@ architecture section 14 requires this and does not allow collapsing them):
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 
+import numpy as np
 import pandas as pd
 
 from core.timeutils import IST_NAME, epoch_series_to_ist
+
+# Every |int| at or below this round-trips through float64 exactly (53
+# mantissa bits). Beyond it, converting to float64 can silently change the
+# value -- see _convert_numeric_exact().
+_MAX_EXACT_FLOAT64_INT = 2**53
 
 TS = "ts"
 OPEN = "open"
@@ -214,57 +222,197 @@ def empty_ohlcv() -> pd.DataFrame:
     )
 
 
-def _to_numeric_strict(series: pd.Series, column: str) -> pd.Series:
-    """Convert to numeric WITHOUT destroying evidence of bad source values.
+def _is_bool_like(value: object) -> bool:
+    """True for a Python ``bool`` or a numpy boolean scalar.
 
-    ``pd.to_numeric(errors="coerce")`` turns an unparseable value into NaN,
-    which is indistinguishable from a value the source genuinely reported as
-    missing. That silently converts a data-integrity failure into ordinary
-    missingness. Here, a value that was present but unparseable raises instead,
-    so the defect surfaces at the boundary with the offending values named.
+    ``bool`` is a subclass of ``int`` in Python -- that is a language
+    implementation detail, not a valid market-data representation. It is
+    rejected explicitly rather than silently converted (``True`` -> ``1.0``).
+    Both a native pandas ``bool`` column and the nullable ``"boolean"``
+    extension dtype must be caught: elements of the latter come back as
+    ``numpy.bool_``, which is NOT a subclass of Python ``bool``.
+    """
+    return isinstance(value, (bool, np.bool_))
 
-    Values that were ALREADY null pass through as null: real missingness is
-    preserved for the validator to report.
+
+def _parse_source_number(value: object) -> int | float:
+    """Parse ONE present, non-null, non-boolean source value.
+
+    Returns a Python ``int`` if the source represents an exact whole number
+    (magnitude not yet checked against float64's exact range -- the caller
+    does that), or a Python ``float`` if the source has a genuine fractional
+    part, is already a binary float, or is +/-inf.
+
+    Raises ``ValueError`` if the value cannot be parsed as a number at all;
+    the caller batches offenders into one ``SchemaError``.
+
+    String parsing goes through ``decimal.Decimal`` rather than a naive
+    ``int()``-then-``float()`` fallback, specifically so that a string like
+    ``"9007199254740993.0"`` -- a whole number that merely carries a
+    redundant decimal point -- is still recognised as whole and exactness-
+    checked, instead of silently falling into the always-accepted float
+    branch and escaping the range check entirely.
+    """
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        # Already a binary float: whatever precision it carries was fixed
+        # before this function ever saw it. Preserving that value exactly --
+        # not re-deriving it from a decimal -- is what "lossless" means here;
+        # there is nothing further to check.
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            d = Decimal(text)
+        except InvalidOperation as exc:
+            raise ValueError("not parseable as numeric") from exc
+        if d.is_nan():
+            # A literal "nan" string is not how this schema represents
+            # missingness (that is a real null, caught before this function
+            # is ever called); treat it as an unparseable value instead of
+            # silently accepting it as missing.
+            raise ValueError("not parseable as numeric")
+        if d.is_infinite():
+            return float(d)
+        if d == d.to_integral_value():
+            return int(d)
+        return float(text)
+    raise ValueError(f"unsupported type {type(value).__name__}")
+
+
+def _convert_numeric_exact(
+    series: pd.Series, column: str, *, whole_numbers_only: bool
+) -> pd.Series:
+    """Convert to float64, REJECTING any conversion that would silently
+    change the numeric value, rather than recording a lossy conversion as a
+    lossless ``DTYPE_CONVERTED`` transformation.
+
+    Policy, precise and non-fuzzy (no epsilon/tolerance is used anywhere):
+
+    * Boolean values are rejected outright -- see ``_is_bool_like``.
+    * A value that were ALREADY null passes through as null: real
+      missingness is preserved for the validator to report.
+    * A value present but unparseable as any number raises, naming the
+      offending value, instead of being coerced to NaN (which would disguise
+      a source defect as ordinary missingness).
+    * A value representing an exact WHOLE NUMBER (a Python/numpy int, or a
+      numeric string/float with no fractional part) must round-trip through
+      float64 exactly. A magnitude beyond +/-2**53 is REJECTED: silently
+      returning a different integer would be a value change, not a
+      representation change (e.g. 9007199254740993 -> 9007199254740992).
+    * A value with a genuine fractional part (e.g. the string ``"24000.13"``,
+      or an existing float) is accepted via ordinary decimal-to-binary
+      conversion. This is NOT treated as lossy: almost no non-power-of-two
+      decimal fraction is exactly representable in binary floating point, so
+      rejecting every such value would make this schema unusable for real
+      decimal prices. This is a representation fact about IEEE-754, not the
+      semantic value modification (rounding, clipping, replacing, filling)
+      the frozen architecture's BLOCKER rule targets.
+    * +/-inf is accepted WHEN THE TARGET IS FLOAT64 (price columns): float64
+      represents it exactly, so nothing is lost by preserving it. A later
+      validation stage (unchanged by this module) is responsible for
+      rejecting a non-finite price as market data.
+
+    When ``whole_numbers_only`` is True (used for volume, ahead of the
+    ``.astype("Int64")`` cast the caller performs), a value with a genuine
+    fractional part is rejected instead of accepted, with the exact same
+    wording as before this correction so existing callers matching on
+    "whole number" continue to work. Infinity is ALSO rejected in this case,
+    for the same reason: Int64 has no representation for it, and accepting
+    it here would only defer the failure to the caller's later cast, which
+    raises a raw ``OverflowError`` instead of a diagnosed ``SchemaError``.
+
+    Volume's ultimate target dtype (Int64) can exactly hold integers far
+    larger than float64's +/-2**53 range, but this function applies the same
+    float64-exact threshold to volume as to prices, deliberately: no
+    realistic trading volume approaches that magnitude, and a dedicated,
+    larger Int64-specific threshold would add complexity this project does
+    not currently need. If that ever changes, it is a separate, explicitly
+    scoped correction.
     """
     was_null = series.isna()
-    converted = pd.to_numeric(series, errors="coerce")
-    destroyed = converted.isna() & ~was_null
-    if destroyed.any():
-        positions = [int(i) for i in range(len(series)) if bool(destroyed.iloc[i])]
-        samples = [repr(series.iloc[i]) for i in positions[:5]]
+
+    bool_positions = [
+        i for i in range(len(series))
+        if not bool(was_null.iloc[i]) and _is_bool_like(series.iloc[i])
+    ]
+    if bool_positions:
+        samples = [repr(series.iloc[i]) for i in bool_positions[:5]]
         raise SchemaError(
-            f"Column {column!r}: {len(positions)} value(s) present in the source "
+            f"Column {column!r}: {len(bool_positions)} value(s) are boolean, "
+            f"e.g. {', '.join(samples)}. bool is a subclass of int as a "
+            "Python implementation detail, not a valid market-data "
+            "representation; refusing to silently convert True/False to a "
+            "number."
+        )
+
+    unparseable: list[object] = []
+    imprecise: list[object] = []
+    fractional: list[object] = []
+    values: list[float] = [float("nan")] * len(series)
+
+    for i in range(len(series)):
+        if bool(was_null.iloc[i]):
+            continue
+        raw = series.iloc[i]
+        try:
+            numeric = _parse_source_number(raw)
+        except ValueError:
+            unparseable.append(raw)
+            continue
+        if isinstance(numeric, int):
+            if abs(numeric) > _MAX_EXACT_FLOAT64_INT:
+                imprecise.append(raw)
+                continue
+            values[i] = float(numeric)
+        else:
+            if math.isinf(numeric):
+                if whole_numbers_only:
+                    # Int64 (volume's eventual target, via the caller's
+                    # .astype("Int64")) has no representation for infinity.
+                    # Accepting it here would leak a raw pandas
+                    # OverflowError from that later cast instead of a
+                    # diagnosed SchemaError -- reproduced directly before
+                    # this fix. Infinity is treated the same as any other
+                    # value with no finite whole-number representation.
+                    fractional.append(raw)
+                    continue
+                values[i] = numeric
+                continue
+            if whole_numbers_only and not numeric.is_integer():
+                fractional.append(raw)
+                continue
+            values[i] = numeric
+
+    if unparseable:
+        samples = [repr(v) for v in unparseable[:5]]
+        raise SchemaError(
+            f"Column {column!r}: {len(unparseable)} value(s) present in the source "
             f"but not parseable as numeric, e.g. {', '.join(samples)}. "
             "Refusing to coerce them to NaN, which would disguise a source "
             "defect as ordinary missing data. Investigate the source."
         )
-    return converted
-
-
-def _is_fractional(value: object) -> bool:
-    return pd.notna(value) and not float(value).is_integer()
-
-
-def _to_whole_number_strict(series: pd.Series, column: str) -> pd.Series:
-    """Convert to nullable Int64, requiring every present value be whole.
-
-    A fractional volume (e.g. 250.7) is a source defect, not data to round or
-    truncate. Rounding it would silently alter what the source reported;
-    letting pandas raise its own ``TypeError`` on the eventual
-    ``.astype("Int64")`` would leak an implementation detail instead of a
-    diagnosed ``SchemaError``. Both are avoided by checking first.
-    """
-    converted = _to_numeric_strict(series, column)
-    fractional_mask = converted.map(_is_fractional)
-    if fractional_mask.any():
-        offending = converted[fractional_mask]
-        samples = offending.head(5).tolist()
+    if imprecise:
+        samples = [repr(v) for v in imprecise[:5]]
         raise SchemaError(
-            f"Column {column!r}: {int(fractional_mask.sum())} value(s) are not "
-            f"whole numbers, e.g. {samples}. Volume is a count of units traded; "
+            f"Column {column!r}: {len(imprecise)} whole-number value(s) exceed "
+            f"float64's exact-integer range (+/-{_MAX_EXACT_FLOAT64_INT}), e.g. "
+            f"{', '.join(samples)}. Converting would silently change the value "
+            "(e.g. 9007199254740993 -> 9007199254740992); refusing rather than "
+            "recording a lossy conversion as lossless."
+        )
+    if fractional:
+        samples = [repr(v) for v in fractional[:5]]
+        raise SchemaError(
+            f"Column {column!r}: {len(fractional)} value(s) are not whole "
+            f"numbers, e.g. {samples}. Volume is a count of units traded; "
             "refusing to round or truncate a fractional value."
         )
-    return converted.astype("Int64")
+
+    result = pd.Series(values, index=series.index, dtype="float64")
+    result[was_null] = float("nan")
+    return result
 
 
 def _dtype_transformation_code(column: str) -> str:
@@ -404,7 +552,7 @@ def canonicalise(frame: pd.DataFrame) -> CanonicalisationResult:
     # dtype, so this stays useful signal rather than noise on every call.
     for col in PRICE_COLUMNS:
         source_dtype = out[col].dtype
-        out[col] = _to_numeric_strict(out[col], col).astype("float64")
+        out[col] = _convert_numeric_exact(out[col], col, whole_numbers_only=False)
         if str(source_dtype) != "float64":
             transformations.append(
                 CanonicalisationTransformation(
@@ -416,7 +564,9 @@ def canonicalise(frame: pd.DataFrame) -> CanonicalisationResult:
             )
 
     volume_source_dtype = out[VOLUME].dtype
-    out[VOLUME] = _to_whole_number_strict(out[VOLUME], VOLUME)
+    out[VOLUME] = _convert_numeric_exact(
+        out[VOLUME], VOLUME, whole_numbers_only=True
+    ).astype("Int64")
     if str(volume_source_dtype) != "Int64":
         transformations.append(
             CanonicalisationTransformation(
@@ -493,12 +643,96 @@ def canonicalise(frame: pd.DataFrame) -> CanonicalisationResult:
     )
 
 
+def _validate_epoch(value: object) -> int:
+    """Validate and return a single FYERS row's raw epoch value as an exact
+    Python ``int``. Raises ``SchemaError`` -- never ``TypeError``,
+    ``ValueError`` from pandas internals, or any other implementation
+    exception -- for anything outside the accepted adapter contract.
+
+    Accepted contract: an integer count of whole seconds since the Unix
+    epoch (matching the FYERS SDK docstring's "epoch value" description).
+    Rejected: booleans; non-finite values (NaN, +/-inf); fractional seconds
+    (no rounding/truncation policy has been decided, and no observed payload
+    has ever needed one); non-numeric strings; and any type this project has
+    no defined interpretation for (e.g. a nested list). Validating and
+    normalising every epoch to a plain ``int`` HERE, before anything else
+    touches it, is what prevents a malformed value from later reaching a raw
+    Python comparison (``a > b``) or pandas conversion and leaking a
+    ``TypeError`` instead of a diagnosed ``SchemaError``.
+    """
+    if _is_bool_like(value):
+        raise SchemaError(
+            f"FYERS epoch value {value!r} is boolean; a bool is not a valid "
+            "epoch timestamp."
+        )
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        f = float(value)
+        if math.isnan(f) or math.isinf(f):
+            raise SchemaError(
+                f"FYERS epoch value {value!r} is non-finite; an epoch must be "
+                "a finite whole number of seconds."
+            )
+        if not f.is_integer():
+            raise SchemaError(
+                f"FYERS epoch value {value!r} is not a whole number of "
+                "seconds; fractional epoch seconds are not part of the "
+                "accepted adapter contract."
+            )
+        return int(f)
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return int(text)
+        except ValueError as exc:
+            raise SchemaError(
+                f"FYERS epoch value {value!r} is not parseable as an integer."
+            ) from exc
+    raise SchemaError(
+        f"FYERS epoch value {value!r} has unsupported type "
+        f"{type(value).__name__}; expected an integer count of seconds."
+    )
+
+
+def _validate_fyers_epochs(candles: list[list]) -> list[list]:
+    """Validate every row's epoch (position 0), returning a NEW list of rows
+    with the epoch replaced by its validated, normalised ``int``. All other
+    positions are passed through unchanged.
+
+    Every offending row is collected and reported together in one
+    ``SchemaError`` (consistent with this module's other batched-diagnostic
+    style), rather than raising on the first bad row and hiding the rest.
+    """
+    validated: list[list] = []
+    errors: list[str] = []
+    for row in candles:
+        try:
+            epoch = _validate_epoch(row[0])
+        except SchemaError as exc:
+            errors.append(str(exc))
+            continue
+        validated.append([epoch, *row[1:]])
+
+    if errors:
+        raise SchemaError(
+            f"{len(errors)} FYERS row(s) have an invalid epoch value. "
+            + " | ".join(errors[:5])
+        )
+    return validated
+
+
 def _adapter_source_evidence(
     candles: list[list],
 ) -> tuple[SourceEvidence, tuple[CanonicalisationAnomaly, ...]]:
     """Structural evidence for a raw FYERS positional payload, computed
-    strictly BEFORE any epoch-to-Timestamp conversion or DataFrame
-    construction. Operates on the Python ``list[list]`` directly.
+    strictly BEFORE epoch-to-Timestamp conversion or DataFrame construction.
+    Operates on the Python ``list[list]`` directly.
+
+    ``candles`` here must already have passed ``_validate_fyers_epochs`` --
+    this function assumes every ``row[0]`` is a plain validated ``int`` and
+    performs no further validation itself, so that ordering comparisons and
+    duplicate counting never encounter a value that could raise.
 
     This is intentionally a separate, simpler implementation from the
     pandas-vectorised logic in ``canonicalise()``: it measures a genuinely
@@ -628,6 +862,14 @@ def canonicalise_fyers_candles(candles: list[list]) -> CanonicalisationResult:
             "may have changed; verify against current FYERS documentation before "
             "adjusting this parser."
         )
+
+    # Validate and normalise every epoch to a plain int BEFORE anything else
+    # touches it (ordering comparisons, duplicate counting, DataFrame
+    # construction). This is what prevents a malformed epoch -- a string, a
+    # bool, NaN, a nested list -- from reaching a raw Python `a > b`
+    # comparison or a pandas conversion and leaking a TypeError/ValueError
+    # instead of a diagnosed SchemaError.
+    candles = _validate_fyers_epochs(candles)
 
     adapter_source, adapter_anomalies = _adapter_source_evidence(candles)
 

@@ -605,6 +605,273 @@ def test_dtype_conversion_is_not_described_as_a_value_change():
     assert "representation" in description.lower()
 
 
+# --- exact numeric representability (manager matrix, sections 1-4) -------
+#
+# Regression: DTYPE_CONVERTED_* was recorded as "lossless" purely because
+# the source dtype differed from the canonical one, with no verification
+# that the VALUE survived. 9007199254740993 -> 9007199254740992.0 was
+# recorded as a successful lossless conversion. Reproduced directly against
+# the unfixed implementation before any change was made.
+
+_MAX_EXACT_INT = 2**53
+
+
+def test_exact_matrix_A_max_exact_int_is_accepted():
+    """2**53 round-trips through float64 exactly -- the boundary itself must
+    still be accepted, not treated as already too large."""
+    frame = make_ohlcv(5)
+    frame[OPEN] = frame[OPEN].astype(object)
+    frame.loc[1, OPEN] = _MAX_EXACT_INT
+    result = canonicalise(frame)
+    assert result.frame[OPEN].iloc[1] == float(_MAX_EXACT_INT)
+
+
+def test_exact_matrix_B_over_max_exact_int_is_rejected():
+    """THE regression case: one past the boundary changes value silently."""
+    frame = make_ohlcv(5)
+    frame[OPEN] = frame[OPEN].astype(object)
+    frame.loc[1, OPEN] = _MAX_EXACT_INT + 1
+    with pytest.raises(SchemaError, match="exact-integer range"):
+        canonicalise(frame)
+
+
+def test_exact_matrix_C_max_exact_int_as_string_is_accepted():
+    frame = make_ohlcv(5)
+    frame[OPEN] = frame[OPEN].astype(object)
+    frame.loc[1, OPEN] = str(_MAX_EXACT_INT)
+    result = canonicalise(frame)
+    assert result.frame[OPEN].iloc[1] == float(_MAX_EXACT_INT)
+
+
+def test_exact_matrix_D_over_max_exact_int_as_string_is_rejected():
+    frame = make_ohlcv(5)
+    frame[OPEN] = frame[OPEN].astype(object)
+    frame.loc[1, OPEN] = str(_MAX_EXACT_INT + 1)
+    with pytest.raises(SchemaError, match="exact-integer range"):
+        canonicalise(frame)
+
+
+def test_exact_matrix_E_ordinary_decimal_string_is_accepted():
+    frame = make_ohlcv(5)
+    frame[OPEN] = frame[OPEN].astype(object)
+    frame.loc[1, OPEN] = "24000.5"
+    result = canonicalise(frame)
+    assert result.frame[OPEN].iloc[1] == 24000.5
+
+
+def test_exact_matrix_F_existing_float64_is_accepted_no_conversion_recorded():
+    frame = make_ohlcv(5)  # OPEN already float64
+    result = canonicalise(frame)
+    assert "DTYPE_CONVERTED_OPEN" not in transformation_codes(result)
+
+
+def test_exact_matrix_G_decimal_pointed_whole_number_string_still_checked():
+    """A whole number merely spelled with a redundant '.0' must not evade
+    the exactness check by falling into the always-accepted fractional path.
+    """
+    frame = make_ohlcv(5)
+    frame[OPEN] = frame[OPEN].astype(object)
+    frame.loc[1, OPEN] = f"{_MAX_EXACT_INT + 1}.0"
+    with pytest.raises(SchemaError, match="exact-integer range"):
+        canonicalise(frame)
+
+
+def test_exact_matrix_negative_over_range_is_also_rejected():
+    frame = make_ohlcv(5)
+    frame[OPEN] = frame[OPEN].astype(object)
+    frame.loc[1, OPEN] = -(_MAX_EXACT_INT + 1)
+    with pytest.raises(SchemaError, match="exact-integer range"):
+        canonicalise(frame)
+
+
+def test_exact_matrix_applies_to_volume_too():
+    """The same exactness policy protects volume, which shares the bug
+    (both routed through the same pre-fix conversion function)."""
+    frame = make_ohlcv(5)
+    frame[VOLUME] = frame[VOLUME].astype(object)
+    frame.loc[1, VOLUME] = _MAX_EXACT_INT + 1
+    with pytest.raises(SchemaError, match="exact-integer range"):
+        canonicalise(frame)
+
+
+# --- boolean values are never valid market data ---------------------------
+
+
+def test_bool_price_is_rejected_python_bool():
+    frame = make_ohlcv(5)
+    frame[OPEN] = frame[OPEN].astype(object)
+    frame.loc[1, OPEN] = True
+    with pytest.raises(SchemaError, match="boolean"):
+        canonicalise(frame)
+
+
+def test_bool_price_false_is_rejected():
+    """False must not silently become 0.0."""
+    frame = make_ohlcv(5)
+    frame[CLOSE] = frame[CLOSE].astype(object)
+    frame.loc[2, CLOSE] = False
+    with pytest.raises(SchemaError, match="boolean"):
+        canonicalise(frame)
+
+
+def test_bool_volume_is_rejected():
+    frame = make_ohlcv(5)
+    frame[VOLUME] = frame[VOLUME].astype(object)
+    frame.loc[1, VOLUME] = True
+    with pytest.raises(SchemaError, match="boolean"):
+        canonicalise(frame)
+
+
+def test_native_bool_dtype_column_is_rejected():
+    """A whole column of native pandas bool dtype, not just a mixed object
+    column with one bool value."""
+    frame = make_ohlcv(5)
+    frame[OPEN] = pd.Series([True, False, True, False, True])
+    with pytest.raises(SchemaError, match="boolean"):
+        canonicalise(frame)
+
+
+def test_nullable_boolean_dtype_column_is_rejected():
+    """Elements of pandas' nullable 'boolean' extension dtype come back as
+    numpy.bool_, not Python bool -- must still be caught."""
+    frame = make_ohlcv(5)
+    frame[OPEN] = pd.array([True, False, True, False, True], dtype="boolean")
+    with pytest.raises(SchemaError, match="boolean"):
+        canonicalise(frame)
+
+
+# --- non-finite source numbers ---------------------------------------------
+
+
+def test_positive_infinity_price_is_accepted_at_the_schema_boundary():
+    """float64 represents +inf exactly; rejecting non-finite PRICES is the
+    validator's job (MarketDataValidity), not canonicalisation's."""
+    frame = make_ohlcv(5)
+    frame[HIGH] = frame[HIGH].astype(object)
+    frame.loc[1, HIGH] = float("inf")
+    result = canonicalise(frame)
+    assert result.frame[HIGH].iloc[1] == float("inf")
+
+
+def test_negative_infinity_price_is_accepted_at_the_schema_boundary():
+    frame = make_ohlcv(5)
+    frame[LOW] = frame[LOW].astype(object)
+    frame.loc[1, LOW] = float("-inf")
+    result = canonicalise(frame)
+    assert result.frame[LOW].iloc[1] == float("-inf")
+
+
+def test_nan_price_still_preserved_as_missing():
+    """Genuine NaN continues to mean missing, unaffected by this correction."""
+    frame = make_ohlcv(5)
+    frame.loc[2, CLOSE] = float("nan")
+    result = canonicalise(frame)
+    assert pd.isna(result.frame[CLOSE].iloc[2])
+
+
+def test_string_nan_is_rejected_not_treated_as_missing():
+    """The literal text 'nan' is not how this schema represents missingness
+    -- genuine missingness is a real null, not a string that spells it."""
+    frame = make_ohlcv(5)
+    frame[CLOSE] = frame[CLOSE].astype(object)
+    frame.loc[2, CLOSE] = "nan"
+    with pytest.raises(SchemaError, match="not parseable as numeric"):
+        canonicalise(frame)
+
+
+def test_infinite_volume_is_still_rejected_as_not_whole():
+    """Volume requires whole_numbers_only=True; inf.is_integer() is False,
+    so it is correctly rejected as fractional rather than silently accepted.
+    """
+    frame = make_ohlcv(5)
+    frame[VOLUME] = frame[VOLUME].astype(object)
+    frame.loc[1, VOLUME] = float("inf")
+    with pytest.raises(SchemaError, match="whole number"):
+        canonicalise(frame)
+
+
+# --- FYERS malformed epoch matrix (manager sections 7-8) ------------------
+
+
+def _fyers_row(epoch):
+    return [epoch, 24000.0, 24005.0, 23995.0, 24001.0, 1000]
+
+
+def test_fyers_epoch_matrix_A_normal_integer_is_accepted():
+    result = canonicalise_fyers_candles([_fyers_row(1767239100)])
+    assert len(result.frame) == 1
+
+
+def test_fyers_epoch_matrix_B_numeric_float_epoch_is_accepted():
+    """The adapter contract accepts a whole-number float epoch (e.g. arriving
+    from a JSON decoder that produces floats); a genuinely fractional epoch
+    is rejected -- see test_fyers_epoch_fractional_is_rejected."""
+    result = canonicalise_fyers_candles([_fyers_row(1767239100.0)])
+    assert len(result.frame) == 1
+
+
+def test_fyers_epoch_fractional_is_rejected():
+    with pytest.raises(SchemaError, match="not a whole number"):
+        canonicalise_fyers_candles([_fyers_row(1767239100.5)])
+
+
+def test_fyers_epoch_matrix_C_non_numeric_string_is_schema_error():
+    with pytest.raises(SchemaError, match="not parseable"):
+        canonicalise_fyers_candles([_fyers_row("bad-epoch")])
+
+
+def test_fyers_epoch_matrix_D_bool_is_schema_error():
+    with pytest.raises(SchemaError, match="boolean"):
+        canonicalise_fyers_candles([_fyers_row(True)])
+
+
+def test_fyers_epoch_matrix_E_nan_is_schema_error():
+    with pytest.raises(SchemaError, match="non-finite"):
+        canonicalise_fyers_candles([_fyers_row(float("nan"))])
+
+
+def test_fyers_epoch_matrix_F_inf_is_schema_error():
+    with pytest.raises(SchemaError, match="non-finite"):
+        canonicalise_fyers_candles([_fyers_row(float("inf"))])
+
+
+def test_fyers_epoch_matrix_G_nested_list_is_schema_error():
+    with pytest.raises(SchemaError, match="unsupported type"):
+        canonicalise_fyers_candles([_fyers_row([1767239100])])
+
+
+def test_fyers_epoch_matrix_H_mixed_types_do_not_leak_typeerror():
+    """Previously: comparing a str epoch against an int epoch during
+    ordering evidence computation raised a raw TypeError. Validation now
+    happens before any comparison, so only SchemaError can ever escape."""
+    rows = [_fyers_row("bad-epoch"), _fyers_row(1767239100)]
+    with pytest.raises(SchemaError):
+        canonicalise_fyers_candles(rows)
+
+
+def test_fyers_epoch_errors_are_batched_not_first_only():
+    """Multiple bad rows must all be reported, not just the first."""
+    rows = [_fyers_row(True), _fyers_row("bad"), _fyers_row(1767239100)]
+    with pytest.raises(SchemaError, match=r"2 FYERS row\(s\)"):
+        canonicalise_fyers_candles(rows)
+
+
+def test_fyers_epoch_failure_produces_no_partial_result():
+    """No CanonicalisationResult must be constructed on failure."""
+    with pytest.raises(SchemaError):
+        canonicalise_fyers_candles([_fyers_row("bad-epoch")])
+    # If this point is reached without the exception above, the test itself
+    # is broken; pytest.raises already enforces atomicity here.
+
+
+def test_fyers_epoch_large_but_exact_integer_is_accepted():
+    """FYERS epochs are ordinary Unix timestamps, nowhere near 2**53, but the
+    same exactness machinery underlies epoch validation as prices -- confirm
+    it does not spuriously reject a realistic value."""
+    result = canonicalise_fyers_candles([_fyers_row(1767239100)])
+    assert result.source.row_count == 1
+
+
 # --- defensive copy and immutability of evidence -------------------------
 
 
