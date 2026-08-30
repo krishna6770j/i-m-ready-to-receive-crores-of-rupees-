@@ -351,6 +351,88 @@ duplicate row added and row removed differ; symbol, resolution and source each
 differ; rows reversed, UTC-vs-IST representation and reordered columns all match.
 Empty and one-row frames encode deterministically and differ.
 
+### 8.3 Equal-timestamp identity ordering — frozen
+
+**Confirmed defect, found in manager review of Unit 3 (commit `6239148`).**
+§8.1 states row ordering is **not** identity. But canonicalisation performs
+only a **stable** sort by timestamp, so when two or more canonical
+observations share exactly one timestamp, their relative order in the
+canonical frame is whatever the source delivered. §8.2's row-order encoding
+("row order is the canonical sort order") then bakes that source-arrival
+order into `data_digest` — making two datasets with the identical
+observation multiset at a shared timestamp, differing only in which arrived
+first, hash differently. That contradicts §8.1.
+
+**Reproduced directly against `6239148`:** two canonical frames, each with
+one timestamp `T` carrying two genuinely different observations `A` and `B`
+(same multiset, same multiplicity — one of each), differing only in
+arrival order (`T:A,B` vs `T:B,A`), produced two different `data_digest`
+values.
+
+**Root cause:** conflating two distinct concerns that must stay separate:
+
+| Concept | What it is | Where it belongs |
+|---|---|---|
+| Source arrival order within a shared timestamp | Provenance evidence — a fact about what the broker sent and in what order | Canonicalisation snapshot / future `provenance_digest` (§6) — **may** differ between two acquisitions of the same logical dataset |
+| The canonical observation multiset at a shared timestamp | Dataset identity | `data_digest` (§8.1) — **must not** differ based on arrival order alone |
+
+`canonicalise()`'s stable sort is correct and **is not changed by this
+section** — it must keep preserving source arrival order in
+`CanonicalisationResult.frame` and in the future canonicalisation snapshot,
+precisely so that provenance can later distinguish "FYERS sent B before A."
+That fact is real and must not be erased. It is simply **not** a dataset
+identity fact, and `data_digest` must stop depending on it.
+
+**Frozen equivalence rule, schema v1:**
+
+1. Timestamps establish primary observation ordering — unchanged.
+2. Within one timestamp shared by two or more canonical observations,
+   **source arrival order is not identity.**
+3. The set of canonical observations at one timestamp is a **multiset**:
+   multiplicity is identity (§7 already establishes this at the whole-dataset
+   level; this makes it explicit per timestamp group).
+4. Therefore identity encoding requires a **deterministic ordering of
+   equal-timestamp observations that does not depend on source arrival
+   order.**
+5. That deterministic order is: **encode each observation's non-timestamp
+   canonical fields (open, high, low, close, volume) using the exact §8.2
+   typed field encoding, concatenate per observation, then sort the
+   equal-timestamp group by those encoded byte strings, lexicographically.**
+   Using the already-canonical encoded bytes — not `repr()`, not string
+   formatting, not raw pandas/Python comparison — is required because it
+   reuses the same normalisation §8.2 already defines (`-0.0`→`+0.0`, every
+   `NaN` payload → one `NAN` token, `±Inf` distinct, volume `NA` distinct
+   from `I64(0)`), so the tie-break ordering is exactly as deterministic and
+   collision-free as the field encoding itself. Raw Python/pandas comparison
+   is explicitly rejected here because `NaN` has no total order under `<`.
+6. Every occurrence within the group is preserved — **sorting is not
+   deduplication.** `T:A` and `T:A,A` remain different (the second has one
+   more encoded-and-sorted element than the first).
+7. Datasets whose timestamps are all strictly unique are **unaffected**:
+   there is no equal-timestamp group to reorder, so this section changes
+   nothing for the ordinary case where no timestamp repeats.
+
+**Consequence for §8.1's identity statement.** "Row ordering is not
+identity" now means precisely: not overall source row order (already true),
+and not source arrival order *within* an equal-timestamp group either. What
+**is** identity, per timestamp, is the timestamp itself plus the multiset of
+observations sharing it (§7's row-multiplicity rule already covers
+duplicate multiplicity generally; this section fixes how a multiset is
+placed into a deterministic byte order for hashing).
+
+**Required future tests** (implementation of this correction is a separate,
+explicitly authorised step — not this document):
+
+| # | Case | Expected `data_digest` |
+|---|---|---|
+| A | `T:A,B` vs `T:B,A` | SAME |
+| B | `T:A,A,B` vs `T:B,A,A` | SAME |
+| C | `T:A` vs `T:A,A` | DIFFERENT |
+| D | `T:A,B` vs `T:A,C` | DIFFERENT |
+| E | `NaN`-bearing equal-timestamp observations, reordered at source | SAME |
+| F | volume-`NA`-bearing equal-timestamp observations, reordered at source | SAME |
+| G | different (non-equal) timestamps reordered at source, then canonicalised | SAME (already covered by the existing reversed-rows test) |
+
 ---
 
 ## 9. Unicode normalisation is a per-field decision
