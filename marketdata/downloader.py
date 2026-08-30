@@ -35,6 +35,11 @@ class DownloadOutcome:
     cleaning: cleaner.CleaningRecord
     manifest: store.DatasetManifest | None
     path: Path | None
+    refusal: str | None = None
+
+    @property
+    def persisted(self) -> bool:
+        return self.path is not None
 
     def summary(self) -> str:
         lines = ["", self.validation.to_text()]
@@ -55,11 +60,20 @@ class DownloadOutcome:
                     f"    FAILED {chunk.range_from}..{chunk.range_to}: {chunk.error}"
                 )
             lines.append("-" * 72)
-        if self.path is not None:
+        if self.path is not None and self.manifest is not None:
             lines += [
                 "",
                 f"STORED: {self.path}",
-                f"  sha256: {self.manifest.content_sha256 if self.manifest else '?'}",
+                f"  sha256          : {self.manifest.content_sha256}",
+                f"  validation      : {self.manifest.validation_status}",
+                f"  fetch           : {self.manifest.fetch_status}",
+                f"  AUTHORITATIVE   : {self.manifest.is_authoritative}",
+            ]
+        else:
+            lines += [
+                "",
+                "NOT STORED",
+                f"  reason: {self.refusal or 'persist disabled'}",
             ]
         return "\n".join(lines)
 
@@ -75,8 +89,15 @@ def download(
     cleaning_operations: list[str] | None = None,
     persist: bool = True,
     notes: str = "",
+    force: bool = False,
 ) -> DownloadOutcome:
-    """Fetch, clean, validate and optionally store one dataset."""
+    """Fetch, clean, validate and conditionally store one dataset.
+
+    Storage is GATED on validation and acquisition completeness. A dataset with
+    ERROR-severity defects, or one whose acquisition had failed chunks, is not
+    written unless ``force=True``, and a forced write is permanently marked
+    non-authoritative in its manifest.
+    """
     fetch_report: FetchReport | None = None
     if isinstance(provider, FyersHistoricalData):
         frame, fetch_report = provider.fetch_candles_with_report(
@@ -97,23 +118,35 @@ def download(
 
     path: Path | None = None
     manifest: store.DatasetManifest | None = None
+    refusal: str | None = None
+
     if persist and len(frame):
-        path, manifest = store.write(
-            frame,
-            data_store_dir,
-            symbol=symbol,
-            resolution=resolution,
-            source=provider.source_name,
-            requested_range={
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-            },
-            cleaning=cleaning_record.to_dict(),
-            notes=notes,
-        )
-        logger.info("stored %d rows -> %s", len(frame), path)
+        try:
+            path, manifest = store.write(
+                frame,
+                data_store_dir,
+                symbol=symbol,
+                resolution=resolution,
+                source=provider.source_name,
+                validation=validation,
+                fetch=fetch_report.to_dict() if fetch_report else None,
+                requested_range={
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                },
+                cleaning=cleaning_record.to_dict(),
+                notes=notes,
+                force=force,
+            )
+            logger.info("stored %d rows -> %s", len(frame), path)
+        except (store.UnvalidatedDataError, store.IncompleteAcquisitionError) as exc:
+            # Not re-raised: the caller still needs the validation report and
+            # coverage detail to understand WHY nothing was written.
+            refusal = str(exc)
+            logger.error("refused to persist: %s", exc)
     elif persist:
-        logger.warning("nothing stored: fetch returned zero rows")
+        refusal = "fetch returned zero rows; nothing to store"
+        logger.warning(refusal)
 
     return DownloadOutcome(
         frame=frame,
@@ -122,4 +155,5 @@ def download(
         cleaning=cleaning_record,
         manifest=manifest,
         path=path,
+        refusal=refusal,
     )

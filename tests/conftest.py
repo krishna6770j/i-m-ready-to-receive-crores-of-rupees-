@@ -68,6 +68,20 @@ def make_ohlcv(
     )
 
 
+def validation_of(frame: pd.DataFrame, resolution: str = "1"):
+    """Run the REAL validator over a frame.
+
+    Tests pass this to ``store.write``. Using the real validator rather than a
+    permissive stub means a test cannot accidentally prove that storage works
+    while the validation gate is bypassed.
+    """
+    from marketdata.validator import validate
+
+    return validate(
+        frame, symbol="TEST", resolution=resolution, expected_interval_minutes=1
+    )
+
+
 @pytest.fixture
 def ohlcv() -> pd.DataFrame:
     return make_ohlcv()

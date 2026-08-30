@@ -80,6 +80,12 @@ class FetchReport:
             "chunks_requested": len(self.chunks),
             "chunks_failed": len(self.failed_chunks),
             "chunks_empty": len(self.empty_chunks),
+            # Consumed by the storage layer to decide whether this acquisition
+            # may be represented as complete.
+            "failed_chunk_detail": [
+                {"from": c.range_from, "to": c.range_to, "error": c.error}
+                for c in self.failed_chunks
+            ],
             "chunk_detail": [
                 {
                     "from": c.range_from,

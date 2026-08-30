@@ -69,10 +69,10 @@ def test_download_is_reproducible(tmp_store):
     assert hashes[0] == hashes[1]
 
 
-def test_bad_data_is_reported_not_silently_stored(tmp_store):
-    """An impossible bar must surface as an ERROR in the report."""
+def test_bad_data_is_reported_AND_not_stored(tmp_store):
+    """Regression: invalid data used to be validated and then stored anyway."""
     payload = candles_payload(5)
-    payload["candles"][2] = [1767238620, 100.0, 50.0, 200.0, 120.0, 10]  # high<low
+    payload["candles"][2] = [payload["candles"][2][0], 100.0, 50.0, 200.0, 120.0, 10]
     provider = make_provider(payload)
     outcome = download(
         provider,
@@ -84,6 +84,71 @@ def test_bad_data_is_reported_not_silently_stored(tmp_store):
     )
     assert not outcome.validation.is_usable
     assert any("OHLC" in i.code for i in outcome.validation.errors)
+    assert not outcome.persisted, "invalid data must never be persisted"
+    assert outcome.path is None
+    assert outcome.refusal is not None and "Refusing to persist" in outcome.refusal
+    parquet_path, _ = store.dataset_paths(tmp_store, "X:Y", "1")
+    assert not parquet_path.exists()
+
+
+def test_failed_chunk_prevents_persistence(tmp_store):
+    """Regression: a half-downloaded year used to be stored as complete."""
+    responses = [
+        candles_payload(20),
+        {"s": "error", "code": -99, "message": "server error"},
+        {"s": "error", "code": -99, "message": "server error"},
+        candles_payload(20, start_epoch=1767239100 + 400000),
+    ]
+    outcome = download(
+        make_provider(responses),
+        symbol="NSE:NIFTY50-INDEX",
+        resolution="1",
+        start=date(2026, 1, 1),
+        end=date(2026, 12, 31),
+        data_store_dir=tmp_store,
+    )
+    assert len(outcome.fetch_report.failed_chunks) == 2
+    assert not outcome.persisted, "partial acquisition must not be persisted"
+    assert "chunk" in outcome.refusal
+
+
+def test_forced_partial_write_is_marked_non_authoritative(tmp_store):
+    """Combined failure mode: invalid data AND a failed chunk, forced."""
+    responses = [
+        candles_payload(20),
+        {"s": "error", "code": -99, "message": "server error"},
+    ]
+    outcome = download(
+        make_provider(responses),
+        symbol="NSE:NIFTY50-INDEX",
+        resolution="1",
+        start=date(2026, 1, 1),
+        end=date(2026, 12, 31),
+        data_store_dir=tmp_store,
+        force=True,
+    )
+    assert outcome.persisted, "force=True should permit an explicit override"
+    m = outcome.manifest
+    assert m.forced is True
+    assert m.fetch_status == "partial"
+    assert len(m.failed_chunks) >= 1
+    assert m.is_authoritative is False
+
+
+def test_summary_states_when_nothing_was_stored(tmp_store):
+    payload = candles_payload(5)
+    payload["candles"][2] = [payload["candles"][2][0], 100.0, 50.0, 200.0, 120.0, 10]
+    outcome = download(
+        make_provider(payload),
+        symbol="X:Y",
+        resolution="1",
+        start=date(2026, 1, 1),
+        end=date(2026, 1, 5),
+        data_store_dir=tmp_store,
+    )
+    text = outcome.summary()
+    assert "NOT STORED" in text
+    assert "Refusing to persist" in text
 
 
 def test_default_download_applies_no_cleaning_operations(tmp_store):

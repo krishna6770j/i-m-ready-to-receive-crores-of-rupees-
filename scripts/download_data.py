@@ -53,6 +53,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end", type=_parse_date)
     parser.add_argument("--no-persist", action="store_true")
     parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Persist even when validation fails or chunks failed. The dataset "
+            "is permanently marked non-authoritative in its manifest."
+        ),
+    )
+    parser.add_argument(
         "--probe-earliest",
         action="store_true",
         help="Determine the earliest date with data instead of downloading.",
@@ -110,13 +118,21 @@ def main(argv: list[str] | None = None) -> int:
             end=args.end,
             data_store_dir=settings.data_store_dir,
             persist=not args.no_persist,
+            force=args.force,
         )
     except BrokerAuthError as exc:
         print(f"\nAuthentication failed: {exc}\n"
               "Run: python scripts/fyers_login.py\n")
         return 3
     print(outcome.summary())
-    return 0 if outcome.validation.is_usable else 1
+
+    if args.no_persist:
+        return 0 if outcome.validation.is_usable else 1
+    # Exit non-zero unless a genuinely authoritative dataset was written, so
+    # that a caller cannot mistake a refusal or a forced write for success.
+    if outcome.manifest is not None and outcome.manifest.is_authoritative:
+        return 0
+    return 1
 
 
 if __name__ == "__main__":

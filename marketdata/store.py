@@ -81,9 +81,27 @@ def software_versions() -> dict:
     }
 
 
+class UnvalidatedDataError(RuntimeError):
+    """Raised when data failing validation would be written as authoritative."""
+
+
+class IncompleteAcquisitionError(RuntimeError):
+    """Raised when a partially-fetched dataset would be written as complete."""
+
+
 @dataclass
 class DatasetManifest:
-    """Provenance record for one stored dataset."""
+    """Provenance record for one stored dataset.
+
+    A consumer must be able to tell these four states apart without re-running
+    validation, so ``validation_status`` and ``fetch_status`` are both recorded
+    and ``is_authoritative`` combines them:
+
+        complete + valid    -> authoritative
+        complete + invalid  -> NOT authoritative
+        partial  + valid    -> NOT authoritative
+        partial  + invalid  -> NOT authoritative
+    """
 
     symbol: str
     resolution: str
@@ -94,13 +112,30 @@ class DatasetManifest:
     timezone: str
     content_sha256: str
     fetched_at_utc: str
+    validation_status: str = "unknown"
+    validation_error_count: int = 0
+    validation_warning_count: int = 0
+    validation_error_codes: list = field(default_factory=list)
+    fetch_status: str = "unknown"
+    failed_chunks: list = field(default_factory=list)
     requested_range: dict = field(default_factory=dict)
     cleaning: dict = field(default_factory=dict)
     software: dict = field(default_factory=dict)
+    forced: bool = False
     notes: str = ""
 
+    @property
+    def is_authoritative(self) -> bool:
+        return (
+            self.validation_status == "valid"
+            and self.fetch_status == "complete"
+            and not self.forced
+        )
+
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2, sort_keys=True)
+        payload = asdict(self)
+        payload["is_authoritative"] = self.is_authoritative
+        return json.dumps(payload, indent=2, sort_keys=True)
 
 
 def content_hash(frame: pd.DataFrame) -> str:
@@ -131,11 +166,47 @@ def write(
     symbol: str,
     resolution: str,
     source: str,
+    validation,
+    fetch: dict | None = None,
     requested_range: dict | None = None,
     cleaning: dict | None = None,
     notes: str = "",
+    force: bool = False,
 ) -> tuple[Path, DatasetManifest]:
-    """Write a canonical frame plus its manifest. Returns (path, manifest)."""
+    """Write a canonical frame plus its manifest.
+
+    ``validation`` is REQUIRED (a ``ValidationReport``). It is not optional and
+    has no default, because the single most dangerous failure mode for this
+    project is corrupt data becoming an authoritative stored dataset that a
+    later backtest silently trusts. Making the parameter mandatory means a
+    caller cannot skip the gate by forgetting about it.
+
+    Raises UnvalidatedDataError when the report contains ERROR-severity issues,
+    and IncompleteAcquisitionError when ``fetch`` reports failed chunks, unless
+    ``force=True``. A forced write is recorded in the manifest as
+    ``forced: true`` and can never be ``is_authoritative``.
+    """
+    errors = list(validation.errors)
+    if errors and not force:
+        raise UnvalidatedDataError(
+            f"Refusing to persist {symbol} {resolution}: validation found "
+            f"{len(errors)} ERROR-severity issue(s) "
+            f"({', '.join(i.code for i in errors)}). Persisting would make "
+            "corrupt data indistinguishable from clean data for every future "
+            "consumer. Fix the source, or pass force=True to record it "
+            "explicitly as non-authoritative."
+        )
+
+    failed_chunks = list((fetch or {}).get("failed_chunk_detail", []))
+    if failed_chunks and not force:
+        raise IncompleteAcquisitionError(
+            f"Refusing to persist {symbol} {resolution}: {len(failed_chunks)} "
+            "acquisition chunk(s) failed, so the dataset does not cover the "
+            "requested range. Storing it would misrepresent a partial download "
+            "as a complete one. Retry the failed windows, or pass force=True to "
+            "record it explicitly as partial and non-authoritative."
+        )
+
     frame = normalise(frame)
     assert_canonical(frame)
     root.mkdir(parents=True, exist_ok=True)
@@ -153,9 +224,18 @@ def write(
         timezone=str(frame[TS].dtype.tz),
         content_sha256=content_hash(frame),
         fetched_at_utc=datetime.now(timezone.utc).isoformat(),
+        validation_status="invalid" if errors else "valid",
+        validation_error_count=len(errors),
+        validation_warning_count=len(validation.warnings),
+        validation_error_codes=[i.code for i in errors],
+        fetch_status=(
+            "unknown" if fetch is None else ("partial" if failed_chunks else "complete")
+        ),
+        failed_chunks=failed_chunks,
         requested_range=requested_range or {},
         cleaning=cleaning or {},
         software=software_versions(),
+        forced=bool(force),
         notes=notes,
     )
     manifest_path.write_text(manifest.to_json(), encoding="utf-8")
@@ -178,7 +258,11 @@ def read(
             f"Dataset {parquet_path.name} has no manifest. Data without provenance "
             "is not trusted here; re-download it."
         )
-    manifest = DatasetManifest(**json.loads(manifest_path.read_text(encoding="utf-8")))
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    # is_authoritative is derived, not stored state; recompute it from the
+    # recorded fields rather than trusting a value someone could hand-edit.
+    payload.pop("is_authoritative", None)
+    manifest = DatasetManifest(**payload)
     return frame, manifest
 
 
