@@ -217,8 +217,36 @@ The **provenance envelope** contains, canonically encoded:
 - **`generation_id` and `namespace`** (§7)
 - Acquisition snapshot (§11)
 - Canonicalisation snapshot (§14)
+- **Validation policy** (added by manager review of Unit 6's implementation)
 - Operator declarations: `forced`, `force_reason`
 - Environment snapshot (§21)
+
+**`data_digest` is not itself an input to `provenance_digest`.** The formula
+above already makes this explicit — `data_digest` and `provenance_digest`
+are computed independently, and only `integrity_id` combines them. An
+implementation that folds `data_digest` into the provenance envelope's own
+encoding conflates DATA identity with PROVENANCE identity: a single changed
+candle would then also change `provenance_digest`, even though nothing
+about HOW the data was acquired, canonicalised or checked actually
+differed. Keeping them separate means two generations with identical
+provenance facts but different underlying candles share `provenance_digest`
+and differ only in `data_digest` (and therefore `integrity_id`) — the
+correct signal for "the provenance process is unchanged; the data is not."
+
+**Validation policy vs validation result.** A dataset's *validation policy*
+(what thresholds/checks were configured — e.g. `expected_interval_minutes`,
+`sigma_threshold`, `session_window`, `max_session_gap_days`) is a
+provenance/config fact: it describes a decision made about HOW to check the
+data, exactly like the canonicalisation snapshot describes HOW the data was
+canonicalised. It belongs in the provenance envelope and therefore in
+`provenance_digest`. The validation *result* (`MarketDataValidity`,
+§2/§4) remains a data-derived fact, recomputed from the stored candles at
+every use, and is correctly excluded from the envelope — recomputing it
+does not require provenance, and storing it as a second, cached assertion
+would risk exactly the kind of stale-assertion drift this design elsewhere
+refuses to allow. Consequence: the same data + the same generation, checked
+under two different validation policies, share one `data_digest` and
+produce two different `provenance_digest`/`integrity_id` values.
 
 | Accidental change | Detected because |
 |---|---|

@@ -26,37 +26,70 @@ itself takes a raw frame rather than separately-suppliable evidence:
 - ``generation_id`` (fresh ``uuid.uuid4()`` unless one is supplied and
   validated) and ``namespace`` (section 7; derived from ``forced``, since no
   filesystem structure exists yet to derive it from independently)
-- ``data_digest`` (``dataset.digest``) -- not explicitly listed among
-  section 6's envelope bullets, but binding it here too means a tampered
-  ``data_digest`` breaks BOTH ``provenance_digest`` and ``integrity_id``,
-  which is strictly stronger than the minimum the architecture text requires
 - canonicalisation snapshot (section 14): ``dataset.transformations``,
   ``dataset.source_anomalies``, ``dataset.source_evidence``
+- ``dataset.validation_policy`` (``marketdata.dataset.ValidationPolicy``) --
+  per manager review of an earlier revision (now reflected in section 6's
+  amended text): a validation POLICY is a provenance/config fact about HOW
+  data was checked, not a data-derived fact -- unlike ``MarketDataValidity``
+  itself (see below), which is recomputed and therefore still NOT bound.
+  Two envelopes for the same data + same generation but a different policy
+  must therefore share ``data_digest`` while producing a different
+  ``provenance_digest``/``integrity_id``.
 - acquisition snapshot (section 11): an optional
   ``marketdata.evidence.FetchReportSnapshot`` -- optional because section
   11.1 explicitly allows ``REQUESTS_UNKNOWN`` ("no acquisition evidence
   (fixtures, manual frames)"); this unit does not yet compute
   ``AcquisitionRequestStatus`` from it (that is Unit 9 in the frozen
   architecture's implementation sequence, section 28) -- it binds the raw,
-  already-immutable evidence snapshot only
+  already-immutable evidence snapshot only. **Consistency-checked**: when
+  supplied, ``fetch.symbol``/``fetch.resolution`` must match
+  ``dataset.identity`` exactly, or ``build()`` raises -- an earlier revision
+  accepted acquisition evidence for a completely different symbol/
+  resolution than the dataset it was bound to. This is an identity
+  consistency check only; coverage/chunk completeness is explicitly Unit
+  9's job, not this one.
 - operator declarations (section 10): ``forced``, ``force_reason``
-  (required non-empty when ``forced=True``)
-- environment snapshot: ``marketdata.store.software_versions()`` (the
-  ACTUAL environment only). Section 22's ``environment_expected_digest`` /
+  (required non-empty when ``forced=True``; ``forced`` must be an actual
+  ``bool`` -- ``1``, ``"true"``, or any other truthy-but-not-``bool`` value
+  is rejected outright rather than coerced)
+- environment snapshot: ``core.environment.software_versions()`` (the
+  ACTUAL environment only; moved here from ``marketdata.store`` -- see
+  below). Section 22's ``environment_expected_digest`` /
   ``ReproducibilityCertification`` machinery is NOT implemented here --
   there is no lock-file-digest concept anywhere in this codebase yet, and
   inventing one to fill this field would be exactly the kind of placeholder
   fact the manager's directive prohibits. This is a deliberately incomplete
   prerequisite, not an oversight; see the module's test/commit notes.
 
-**Deliberately NOT bound**: validation policy/evidence
-(``marketdata.dataset.ValidationPolicy`` / ``.validation``). Section 6's
+``data_digest`` (``dataset.digest``) is exposed as ``.data_digest`` and
+still feeds ``integrity_id``, but is deliberately NOT part of
+``_encode_envelope()``/``provenance_digest`` -- an earlier revision included
+it there too, conflating DATA identity with PROVENANCE identity: changing
+one candle value then changed provenance_digest despite nothing about HOW
+the data was acquired/checked/handled actually differing. Keeping them
+separate means two generations with identical provenance facts but
+different underlying candles get the same ``provenance_digest`` and a
+different ``integrity_id`` (via ``data_digest`` alone), which is the
+correct signal for "provenance process unchanged, data changed."
+
+**Deliberately NOT bound**: the validation RESULT
+(``ValidatedDataset.validation`` / ``MarketDataValidity``). Section 6's
 envelope bullet list does not name it, and sections 2/4 classify
 ``MarketDataValidity`` as a data-derived fact that is RECOMPUTED from stored
 data at every use (not integrity-bound provenance the way acquisition or
 canonicalisation evidence is, since those describe an external process that
-cannot be reconstructed from the final data alone). Binding it here would be
-inventing a requirement the frozen text does not state.
+cannot be reconstructed from the final data alone). Binding the RESULT here
+would be inventing a requirement the frozen text does not state; the POLICY
+(above) is different and is bound.
+
+**No dependency on ``marketdata.store``.** An earlier revision imported
+``software_versions`` from ``marketdata.store``, which would create an
+import cycle the day a storage unit needs to import ``marketdata.provenance``
+(to persist an envelope). The environment/git-version snapshot now lives in
+``core.environment`` -- a module below both ``marketdata.store`` and
+``marketdata.provenance`` -- moved verbatim, not redesigned; ``store.py``
+imports it from there too and its own tests are unaffected.
 """
 
 from __future__ import annotations
@@ -67,14 +100,15 @@ import struct
 import uuid
 from collections.abc import Mapping
 from dataclasses import fields as dataclass_fields, is_dataclass
+from datetime import time as _time
 from enum import Enum
 from types import MappingProxyType
 from typing import Any
 
-from marketdata.dataset import ValidatedDataset
+from core.environment import software_versions
+from marketdata.dataset import ValidatedDataset, ValidationPolicy
 from marketdata.evidence import FetchReportSnapshot
 from marketdata.schemas import MARKET_DATA_SCHEMA_VERSION
-from marketdata.store import software_versions
 
 # Frozen contract (section 8.0's sibling for provenance, section 6).
 # Versioned independently of MARKET_DATA_SCHEMA_VERSION -- acquisition
@@ -157,6 +191,10 @@ _TAG_BOOL = 0x03
 _TAG_NA = 0x04
 _TAG_SEQ = 0x05
 _TAG_UUID = 0x06
+_TAG_F64 = 0x07
+_TAG_NAN = 0x08
+_TAG_POSINF = 0x09
+_TAG_NEGINF = 0x0A
 
 
 def _encode_field(tag: int, payload: bytes) -> bytes:
@@ -193,8 +231,28 @@ def _encode_value(value: Any) -> bytes:
         return _encode_field(_TAG_BOOL, bytes([1 if value else 0]))
     if isinstance(value, uuid.UUID):
         return _encode_field(_TAG_UUID, value.bytes)
+    if isinstance(value, _time):
+        # ValidationPolicy.session_window elements. ISO-8601 ("HH:MM:SS[.ffffff]")
+        # is a lossless, unambiguous text representation of a bare time-of-day.
+        return _encode_str(value.isoformat())
     if isinstance(value, int):
         return _encode_i64(value)
+    if isinstance(value, float):
+        # ValidationPolicy.sigma_threshold/max_session_gap_days. Same
+        # normalisation policy as marketdata/identity.py's price encoding:
+        # NaN/+-Inf get dedicated zero-length tags (ValidationPolicy itself
+        # already forbids them, but this encoder is reused generically, so
+        # it does not silently rely on that upstream guarantee), and -0.0
+        # collapses to +0.0.
+        if value != value:  # NaN
+            return _encode_field(_TAG_NAN, b"")
+        if value == float("inf"):
+            return _encode_field(_TAG_POSINF, b"")
+        if value == float("-inf"):
+            return _encode_field(_TAG_NEGINF, b"")
+        if value == 0.0:
+            value = 0.0
+        return _encode_field(_TAG_F64, struct.pack(">d", value))
     if isinstance(value, str):
         return _encode_str(value)
     if isinstance(value, (tuple, list)):
@@ -245,6 +303,7 @@ class ProvenanceEnvelope:
         "_transformations",
         "_source_anomalies",
         "_source_evidence",
+        "_validation_policy",
         "_fetch",
         "_forced",
         "_force_reason",
@@ -304,7 +363,16 @@ class ProvenanceEnvelope:
         the full design is explicitly future work (section 7/13, not this
         unit).
 
-        ``fetch``, if given, must be an actual ``FetchReportSnapshot``.
+        ``fetch``, if given, must be an actual ``FetchReportSnapshot`` whose
+        ``symbol``/``resolution`` match ``dataset.identity`` exactly --
+        acquisition evidence for a different instrument/resolution than the
+        dataset it is being bound to is rejected as a provenance
+        consistency error. This is an identity check only: chunk/coverage
+        completeness is Unit 9's job, not this one.
+
+        ``forced`` must be an actual ``bool`` -- ``1``, ``0``, ``"true"``,
+        ``[]`` and other truthy-but-not-``bool`` values are all rejected
+        rather than silently coerced via ``bool(forced)``.
 
         ``generation_id`` defaults to a fresh ``uuid.uuid4()``; if supplied,
         it is validated as an actual version-4 UUID.
@@ -318,6 +386,25 @@ class ProvenanceEnvelope:
             raise TypeError(
                 "fetch must be None or an actual FetchReportSnapshot "
                 f"instance, got {type(fetch).__name__}."
+            )
+        if fetch is not None and (
+            fetch.symbol != dataset.identity.symbol
+            or fetch.resolution != dataset.identity.resolution
+        ):
+            raise ValueError(
+                "Refusing to build a ProvenanceEnvelope: fetch evidence "
+                f"describes symbol={fetch.symbol!r} resolution="
+                f"{fetch.resolution!r}, but dataset.identity is symbol="
+                f"{dataset.identity.symbol!r} resolution="
+                f"{dataset.identity.resolution!r}. Acquisition evidence "
+                "must describe the exact instrument/resolution it is bound to."
+            )
+        if not isinstance(forced, bool):
+            raise TypeError(
+                f"forced must be an actual bool, got {forced!r} "
+                f"({type(forced).__name__}). Truthy-but-not-bool values "
+                "(1, \"true\", [...], ...) are rejected rather than "
+                "silently coerced."
             )
         if forced and not (isinstance(force_reason, str) and force_reason.strip()):
             raise ValueError(
@@ -351,8 +438,9 @@ class ProvenanceEnvelope:
         object.__setattr__(self, "_transformations", dataset.transformations)
         object.__setattr__(self, "_source_anomalies", dataset.source_anomalies)
         object.__setattr__(self, "_source_evidence", dataset.source_evidence)
+        object.__setattr__(self, "_validation_policy", dataset.validation_policy)
         object.__setattr__(self, "_fetch", fetch)
-        object.__setattr__(self, "_forced", bool(forced))
+        object.__setattr__(self, "_forced", forced)
         object.__setattr__(self, "_force_reason", force_reason)
         object.__setattr__(self, "_software", software)
 
@@ -367,7 +455,14 @@ class ProvenanceEnvelope:
         return self
 
     def _encode_envelope(self) -> bytes:
-        """The exact byte stream ``provenance_digest`` hashes."""
+        """The exact byte stream ``provenance_digest`` hashes.
+
+        Deliberately excludes ``data_digest`` -- see the module docstring's
+        "DATA identity vs PROVENANCE identity" note. ``data_digest`` is
+        still bound into ``integrity_id`` separately (raw bytes, in
+        ``build()``), so tampering with it is still detected; it just no
+        longer changes ``provenance_digest`` itself.
+        """
         ordered_fields = (
             ("provenance_schema_version", self._provenance_schema_version),
             ("market_data_schema_version", self._market_data_schema_version),
@@ -376,10 +471,10 @@ class ProvenanceEnvelope:
             ("resolution", self._resolution),
             ("generation_id", self._generation_id),
             ("namespace", self._namespace),
-            ("data_digest", self._data_digest),
             ("transformations", self._transformations),
             ("source_anomalies", self._source_anomalies),
             ("source_evidence", self._source_evidence),
+            ("validation_policy", self._validation_policy),
             ("fetch", self._fetch),
             ("forced", self._forced),
             ("force_reason", self._force_reason),
@@ -436,6 +531,10 @@ class ProvenanceEnvelope:
     @property
     def source_evidence(self):
         return self._source_evidence
+
+    @property
+    def validation_policy(self) -> ValidationPolicy:
+        return self._validation_policy
 
     @property
     def fetch(self) -> FetchReportSnapshot | None:

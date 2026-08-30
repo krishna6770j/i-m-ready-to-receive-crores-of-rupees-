@@ -18,7 +18,7 @@ import pandas as pd
 import pytest
 
 from core.timeutils import IST_NAME
-from marketdata.dataset import ValidatedDataset
+from marketdata.dataset import ValidatedDataset, ValidationPolicy
 from marketdata.evidence import ChunkResultSnapshot, FetchReportSnapshot
 from marketdata.identity import DatasetIdentity
 from marketdata.provenance import (
@@ -61,8 +61,11 @@ def _valid_frame(n: int = 5, *, base: float = 24000.0) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _dataset(**identity_overrides) -> ValidatedDataset:
-    return ValidatedDataset.build(_valid_frame(), identity=_identity(**identity_overrides))
+def _dataset(*, validation_policy: ValidationPolicy | None = None, **identity_overrides) -> ValidatedDataset:
+    kwargs = {}
+    if validation_policy is not None:
+        kwargs["validation_policy"] = validation_policy
+    return ValidatedDataset.build(_valid_frame(), identity=_identity(**identity_overrides), **kwargs)
 
 
 def _fetch_snapshot(**overrides) -> FetchReportSnapshot:
@@ -221,6 +224,21 @@ def test_force_reason_without_forced_rejected():
         ProvenanceEnvelope.build(_dataset(), forced=False, force_reason="some reason")
 
 
+@pytest.mark.parametrize("bad_forced", [1, 0, "true", "", [], ["x"], None])
+def test_forced_non_bool_rejected(bad_forced):
+    with pytest.raises(TypeError):
+        ProvenanceEnvelope.build(_dataset(), forced=bad_forced)
+
+
+def test_forced_actual_bool_true_and_false_accepted():
+    env_false = ProvenanceEnvelope.build(_dataset(), forced=False)
+    assert env_false.forced is False
+    env_true = ProvenanceEnvelope.build(
+        _dataset(), forced=True, force_reason="backfill"
+    )
+    assert env_true.forced is True
+
+
 def test_namespace_forced_with_reason():
     env = ProvenanceEnvelope.build(
         _dataset(), forced=True, force_reason="operator override for backfill"
@@ -349,13 +367,56 @@ def test_fake_fetch_object_rejected():
         ProvenanceEnvelope.build(_dataset(), fetch=FakeFetch())
 
 
-# --- validation policy/evidence: deliberately NOT bound ---------------------
+def test_fetch_wrong_symbol_rejected():
+    ds = _dataset(symbol="NIFTY")
+    mismatched = _fetch_snapshot(symbol="SBIN", resolution="1")
+    with pytest.raises(ValueError):
+        ProvenanceEnvelope.build(ds, fetch=mismatched)
 
 
-def test_validation_evidence_is_not_part_of_the_envelope():
+def test_fetch_wrong_resolution_rejected():
+    ds = _dataset(resolution="1")
+    mismatched = _fetch_snapshot(symbol="NIFTY", resolution="5")
+    with pytest.raises(ValueError):
+        ProvenanceEnvelope.build(ds, fetch=mismatched)
+
+
+def test_fetch_matching_identity_accepted():
+    ds = _dataset(symbol="NIFTY", resolution="1")
+    matching = _fetch_snapshot(symbol="NIFTY", resolution="1")
+    env = ProvenanceEnvelope.build(ds, fetch=matching)
+    assert env.fetch is matching
+
+
+# --- validation policy: bound as provenance/config evidence -----------------
+
+
+def test_validation_policy_is_bound_to_the_envelope():
+    policy = ValidationPolicy(max_session_gap_days=3.0)
+    env = ProvenanceEnvelope.build(_dataset(validation_policy=policy))
+    assert env.validation_policy == policy
+
+
+def test_validation_result_is_not_part_of_the_envelope():
+    # The RESULT (ValidationReportSnapshot / MarketDataValidity) is
+    # data-derived and recomputed elsewhere; only the POLICY is bound here.
     env = ProvenanceEnvelope.build(_dataset())
     assert not hasattr(env, "validation")
-    assert not hasattr(env, "validation_policy")
+    assert not hasattr(env, "market_data_validity")
+
+
+def test_different_validation_policy_changes_provenance_digest_not_data_digest():
+    ds_default = _dataset()
+    ds_custom = _dataset(validation_policy=ValidationPolicy(max_session_gap_days=3.0))
+    assert ds_default.digest == ds_custom.digest  # same underlying data
+
+    gid = uuid.uuid4()
+    env_default = ProvenanceEnvelope.build(ds_default, generation_id=gid)
+    env_custom = ProvenanceEnvelope.build(ds_custom, generation_id=gid)
+
+    assert env_default.data_digest == env_custom.data_digest
+    assert env_default.provenance_digest != env_custom.provenance_digest
+    assert env_default.integrity_id != env_custom.integrity_id
 
 
 # --- mutable source evidence cannot change envelope after construction -----
@@ -385,9 +446,37 @@ def test_fake_dataset_object_rejected():
         transformations = ()
         source_anomalies = ()
         source_evidence = None
+        validation_policy = ValidationPolicy()
 
     with pytest.raises(TypeError):
         ProvenanceEnvelope.build(FakeDataset())
+
+
+# --- DATA identity vs PROVENANCE identity: kept separate --------------------
+
+
+def test_changed_candle_changes_data_digest_but_not_provenance_digest():
+    identity = _identity()
+    gid = uuid.uuid4()
+
+    ds_original = ValidatedDataset.build(_valid_frame(), identity=identity)
+    changed_frame = _valid_frame()
+    changed_frame.iloc[0, changed_frame.columns.get_loc(OPEN)] = 99999.0
+    ds_changed = ValidatedDataset.build(changed_frame, identity=identity)
+
+    env_original = ProvenanceEnvelope.build(ds_original, generation_id=gid)
+    env_changed = ProvenanceEnvelope.build(ds_changed, generation_id=gid)
+
+    assert env_original.data_digest != env_changed.data_digest
+    assert env_original.provenance_digest == env_changed.provenance_digest
+    assert env_original.integrity_id != env_changed.integrity_id
+
+
+def test_data_digest_not_present_in_encoded_envelope_bytes():
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds)
+    encoded = env._encode_envelope()
+    assert env.data_digest.encode("ascii") not in encoded
 
 
 # --- integrity_id -------------------------------------------------------------
