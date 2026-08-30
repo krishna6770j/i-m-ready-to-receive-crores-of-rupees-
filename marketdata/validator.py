@@ -33,6 +33,12 @@ from marketdata.schemas import (
 
 MAX_SAMPLES = 5
 
+# Gaps larger than this are treated as missing data regardless of whether a
+# trading calendar is configured. This is deliberately NOT an exchange calendar
+# rule: it is an absurdity ceiling. No equity market closes for a month, so a
+# gap this large cannot be a legitimate session break.
+ABSURD_GAP_DAYS = 30
+
 
 class Severity(str, Enum):
     """How seriously to take an issue.
@@ -167,6 +173,7 @@ def validate(
     expected_interval_minutes: int | None = None,
     sigma_threshold: float = 10.0,
     session_window: tuple[time, time] | None = None,
+    max_session_gap_days: float | None = None,
 ) -> ValidationReport:
     """Run all data quality checks and return a structured report.
 
@@ -183,6 +190,11 @@ def validate(
             and recorded as skipped -- NSE session boundaries changed on
             2026-08-03 and the exact windows differ by segment and remain
             unconfirmed, so guessing them would manufacture false failures.
+        max_session_gap_days: Largest cross-day gap considered legitimate for
+            this instrument's calendar. When None, cross-day gaps are reported
+            with their magnitude as a WARNING stating that no calendar is
+            configured, rather than being assumed expected. Gaps beyond
+            ABSURD_GAP_DAYS are an ERROR either way.
     """
     has_ts = TS in frame.columns
     tz_attr = getattr(frame[TS].dtype, "tz", None) if has_ts else None
@@ -332,7 +344,40 @@ def validate(
             )
         )
 
-    negative_volume = frame[VOLUME] < 0
+    # Non-finite prices. +inf passes every comparison-based rule above
+    # (it is "positive", it is >= everything), so it needs its own check or an
+    # infinite price would be classified as a valid bar.
+    non_finite = ~np.isfinite(frame[list(PRICE_COLUMNS)].to_numpy(dtype="float64"))
+    non_finite_rows = pd.Series(non_finite.any(axis=1), index=frame.index)
+    only_inf = non_finite_rows & ~nulls
+    if only_inf.any():
+        report.add(
+            ValidationIssue(
+                "NON_FINITE_PRICE",
+                Severity.ERROR,
+                "One or more OHLC values are +inf or -inf. An infinite price is "
+                "not a market observation.",
+                count=int(only_inf.sum()),
+                samples=_samples(frame.loc[only_inf, TS]),
+            )
+        )
+
+    # Volume is nullable Int64 so that missing volume stays missing. Both the
+    # missing case and the negative case are reported rather than repaired.
+    null_volume = frame[VOLUME].isna()
+    if null_volume.any():
+        report.add(
+            ValidationIssue(
+                "NULL_VOLUME",
+                Severity.ERROR,
+                "Volume is missing. It is reported, never filled with 0, because "
+                "0 would assert that no trading occurred.",
+                count=int(null_volume.sum()),
+                samples=_samples(frame.loc[null_volume, TS]),
+            )
+        )
+
+    negative_volume = (frame[VOLUME] < 0).fillna(False)
     if negative_volume.any():
         report.add(
             ValidationIssue(
@@ -388,14 +433,62 @@ def validate(
                 )
             )
         if overnight.any():
-            report.add(
-                ValidationIssue(
-                    "SESSION_BOUNDARIES",
-                    Severity.INFO,
-                    f"{int(overnight.sum())} day boundaries detected (expected).",
-                    count=int(overnight.sum()),
+            # A cross-day gap may be an ordinary overnight break, a weekend, a
+            # market holiday, or a large block of missing data. Without a
+            # trading calendar this project cannot tell those apart, so it
+            # reports the MAGNITUDE and refuses to call them all "expected".
+            gap_days = (deltas[overnight] / pd.Timedelta(days=1)).astype(float)
+            largest = float(gap_days.max())
+
+            if max_session_gap_days is None:
+                report.add(
+                    ValidationIssue(
+                        "TRADING_CALENDAR_NOT_CONFIGURED",
+                        Severity.WARNING,
+                        f"{int(overnight.sum())} cross-day gap(s); largest spans "
+                        f"{largest:.1f} calendar days. No trading calendar is "
+                        "configured, so weekends, holidays and genuinely missing "
+                        "data CANNOT be distinguished. Supply "
+                        "max_session_gap_days once the instrument's session "
+                        "calendar is settled.",
+                        count=int(overnight.sum()),
+                        samples=_samples(frame.loc[overnight, TS]),
+                    )
                 )
-            )
+            else:
+                excessive = overnight & (
+                    deltas > pd.Timedelta(days=max_session_gap_days)
+                )
+                if excessive.any():
+                    report.add(
+                        ValidationIssue(
+                            "EXCESSIVE_DATA_GAP",
+                            Severity.ERROR,
+                            f"{int(excessive.sum())} gap(s) exceed the configured "
+                            f"maximum of {max_session_gap_days} calendar days; "
+                            f"largest spans {largest:.1f} days.",
+                            count=int(excessive.sum()),
+                            samples=_samples(frame.loc[excessive, TS]),
+                        )
+                    )
+
+            # Absurdity ceiling, applied regardless of configuration. This does
+            # not encode any exchange's calendar: no equity market closes for a
+            # month, so a gap this large is missing data by construction.
+            absurd = overnight & (deltas > pd.Timedelta(days=ABSURD_GAP_DAYS))
+            if absurd.any():
+                report.add(
+                    ValidationIssue(
+                        "IMPLAUSIBLE_DATA_GAP",
+                        Severity.ERROR,
+                        f"{int(absurd.sum())} gap(s) exceed {ABSURD_GAP_DAYS} "
+                        f"calendar days; largest spans {largest:.1f} days. No "
+                        "equity market closes this long, so this is missing "
+                        "data irrespective of any trading calendar.",
+                        count=int(absurd.sum()),
+                        samples=_samples(frame.loc[absurd, TS]),
+                    )
+                )
 
     # --- session boundaries ------------------------------------------------
     if session_window is None:

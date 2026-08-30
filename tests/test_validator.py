@@ -88,6 +88,41 @@ def test_detects_negative_volume():
     assert "NEGATIVE_VOLUME" in codes(report)
 
 
+def test_detects_missing_volume():
+    """Missing volume must be reported, never filled with 0."""
+    frame = make_ohlcv(50)
+    frame.loc[6, VOLUME] = pd.NA
+    report = run(frame)
+    assert "NULL_VOLUME" in codes(report)
+    assert not report.is_usable
+
+
+def test_detects_positive_infinity_price():
+    """+inf passes every comparison rule, so it needs its own check."""
+    frame = make_ohlcv(50)
+    frame.loc[11, HIGH] = float("inf")
+    report = run(frame)
+    assert "NON_FINITE_PRICE" in codes(report)
+    assert not report.is_usable
+
+
+def test_detects_negative_infinity_price():
+    frame = make_ohlcv(50)
+    frame.loc[12, LOW] = float("-inf")
+    report = run(frame)
+    assert "NON_FINITE_PRICE" in codes(report)
+    assert not report.is_usable
+
+
+def test_nan_is_reported_as_null_not_as_non_finite():
+    """NaN and inf are different defects and must not be conflated."""
+    frame = make_ohlcv(50)
+    frame.loc[13, CLOSE] = float("nan")
+    report = run(frame)
+    assert "NULL_PRICE" in codes(report)
+    assert "NON_FINITE_PRICE" not in codes(report)
+
+
 def test_detects_duplicate_timestamps():
     frame = make_ohlcv(20)
     dup = pd.concat([frame, frame.iloc[[5]]], ignore_index=True)
@@ -153,16 +188,72 @@ def test_detects_extreme_return():
     assert "EXTREME_RETURN" in codes(report)
 
 
-def test_session_boundary_is_info_not_warning():
-    """Overnight boundaries are expected and must not look like defects."""
-    day1 = make_ohlcv(10, start="2026-01-01 09:15", seed=1)
-    day2 = make_ohlcv(10, start="2026-01-02 09:15", seed=2)
-    frame = pd.concat([day1, day2], ignore_index=True)
-    report = run(frame, expected_interval_minutes=1)
-    assert "SESSION_BOUNDARIES" in codes(report)
-    boundary = next(i for i in report.issues if i.code == "SESSION_BOUNDARIES")
-    assert boundary.severity is Severity.INFO
+def _two_blocks(d1: str, d2: str) -> pd.DataFrame:
+    return pd.concat(
+        [
+            make_ohlcv(10, start=f"{d1} 09:15", seed=1),
+            make_ohlcv(10, start=f"{d2} 09:15", seed=2),
+        ],
+        ignore_index=True,
+    )
+
+
+def test_cross_day_gap_reports_magnitude_when_no_calendar_configured():
+    """Without a calendar, a cross-day gap must not be called 'expected'.
+
+    Regression for the defect where every cross-day gap -- overnight or
+    four months -- was reported identically as an expected day boundary.
+    """
+    report = run(_two_blocks("2026-01-01", "2026-01-02"), expected_interval_minutes=1)
+    assert "TRADING_CALENDAR_NOT_CONFIGURED" in codes(report)
+    issue = next(
+        i for i in report.issues if i.code == "TRADING_CALENDAR_NOT_CONFIGURED"
+    )
+    assert issue.severity is Severity.WARNING
+    assert "calendar days" in issue.message
     assert "WITHIN_DAY_GAPS" not in codes(report)
+
+
+def test_multi_month_hole_is_an_error_even_without_a_calendar():
+    """A four-month hole is missing data under any calendar. THE key regression."""
+    report = run(_two_blocks("2026-01-05", "2026-05-05"), expected_interval_minutes=1)
+    assert "IMPLAUSIBLE_DATA_GAP" in codes(report)
+    assert not report.is_usable, "a four-month hole must not be classified usable"
+
+
+def test_overnight_gap_is_not_an_implausible_gap():
+    """The absurdity ceiling must not fire on ordinary breaks."""
+    report = run(_two_blocks("2026-01-01", "2026-01-02"), expected_interval_minutes=1)
+    assert "IMPLAUSIBLE_DATA_GAP" not in codes(report)
+    assert report.is_usable
+
+
+def test_weekend_gap_is_not_an_implausible_gap():
+    report = run(_two_blocks("2026-01-02", "2026-01-05"), expected_interval_minutes=1)
+    assert "IMPLAUSIBLE_DATA_GAP" not in codes(report)
+    assert report.is_usable
+
+
+def test_configured_calendar_flags_excessive_gap_as_error():
+    """With a calendar bound, gaps beyond it are ERRORs."""
+    report = run(
+        _two_blocks("2026-01-05", "2026-01-12"),
+        expected_interval_minutes=1,
+        max_session_gap_days=4,
+    )
+    assert "EXCESSIVE_DATA_GAP" in codes(report)
+    assert not report.is_usable
+    assert "TRADING_CALENDAR_NOT_CONFIGURED" not in codes(report)
+
+
+def test_configured_calendar_accepts_gap_within_limit():
+    report = run(
+        _two_blocks("2026-01-02", "2026-01-05"),
+        expected_interval_minutes=1,
+        max_session_gap_days=4,
+    )
+    assert "EXCESSIVE_DATA_GAP" not in codes(report)
+    assert report.is_usable
 
 
 def test_session_window_check_is_skipped_when_not_supplied(ohlcv):

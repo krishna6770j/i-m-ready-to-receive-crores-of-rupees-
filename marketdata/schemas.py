@@ -45,7 +45,7 @@ def empty_ohlcv() -> pd.DataFrame:
             HIGH: pd.Series([], dtype="float64"),
             LOW: pd.Series([], dtype="float64"),
             CLOSE: pd.Series([], dtype="float64"),
-            VOLUME: pd.Series([], dtype="int64"),
+            VOLUME: pd.Series([], dtype="Int64"),
         }
     )
 
@@ -78,12 +78,44 @@ def from_fyers_candles(candles: list[list]) -> pd.DataFrame:
     return normalise(frame)
 
 
-def normalise(frame: pd.DataFrame) -> pd.DataFrame:
-    """Coerce a frame to canonical dtypes, column order and sorting.
+def _to_numeric_strict(series: pd.Series, column: str) -> pd.Series:
+    """Convert to numeric WITHOUT destroying evidence of bad source values.
 
-    Does not repair data problems -- duplicates, gaps and OHLC violations are
-    left intact for the validator to find and report. This function only makes
-    the container consistent.
+    ``pd.to_numeric(errors="coerce")`` turns an unparseable value into NaN,
+    which is indistinguishable from a value the source genuinely reported as
+    missing. That silently converts a data-integrity failure into ordinary
+    missingness. Here, a value that was present but unparseable raises instead,
+    so the defect surfaces at the boundary with the offending values named.
+
+    Values that were ALREADY null pass through as null: real missingness is
+    preserved for the validator to report.
+    """
+    was_null = series.isna()
+    converted = pd.to_numeric(series, errors="coerce")
+    destroyed = converted.isna() & ~was_null
+    if destroyed.any():
+        positions = [int(i) for i in range(len(series)) if bool(destroyed.iloc[i])]
+        samples = [repr(series.iloc[i]) for i in positions[:5]]
+        raise SchemaError(
+            f"Column {column!r}: {len(positions)} value(s) present in the source "
+            f"but not parseable as numeric, e.g. {', '.join(samples)}. "
+            "Refusing to coerce them to NaN, which would disguise a source "
+            "defect as ordinary missing data. Investigate the source."
+        )
+    return converted
+
+
+def normalise(frame: pd.DataFrame) -> pd.DataFrame:
+    """Make the container canonical WITHOUT altering any market value.
+
+    Permitted here: column selection and ordering, dtype conversion that
+    preserves values, timezone conversion that preserves the instant, and
+    deterministic stable sorting by timestamp.
+
+    Explicitly NOT permitted: replacing missing values, fabricating volume,
+    interpolating prices, dropping rows, or coercing unparseable source values
+    into NaN. Duplicates, gaps and OHLC violations are left intact for the
+    validator to find and report.
     """
     missing = [c for c in OHLCV_COLUMNS if c not in frame.columns]
     if missing:
@@ -102,10 +134,11 @@ def normalise(frame: pd.DataFrame) -> pd.DataFrame:
         out[TS] = out[TS].dt.tz_convert(IST_NAME)
 
     for col in PRICE_COLUMNS:
-        out[col] = pd.to_numeric(out[col], errors="coerce").astype("float64")
-    out[VOLUME] = (
-        pd.to_numeric(out[VOLUME], errors="coerce").fillna(0).astype("int64")
-    )
+        out[col] = _to_numeric_strict(out[col], col).astype("float64")
+    # Volume uses pandas' nullable Int64 so that MISSING volume stays missing.
+    # Filling it with 0 would fabricate a market fact ("no trades occurred")
+    # that the source never asserted; the validator reports missingness instead.
+    out[VOLUME] = _to_numeric_strict(out[VOLUME], VOLUME).astype("Int64")
 
     out = out.sort_values(TS, kind="stable").reset_index(drop=True)
     return out
@@ -124,7 +157,10 @@ def assert_canonical(frame: pd.DataFrame) -> None:
     for col in PRICE_COLUMNS:
         if frame[col].dtype != "float64":
             raise SchemaError(f"'{col}' must be float64, got {frame[col].dtype}")
-    if frame[VOLUME].dtype != "int64":
-        raise SchemaError(f"'{VOLUME}' must be int64, got {frame[VOLUME].dtype}")
+    if str(frame[VOLUME].dtype) != "Int64":
+        raise SchemaError(
+            f"'{VOLUME}' must be nullable Int64 (so missing volume stays "
+            f"missing rather than being fabricated as 0), got {frame[VOLUME].dtype}"
+        )
     if not frame[TS].is_monotonic_increasing:
         raise SchemaError(f"'{TS}' must be sorted ascending")

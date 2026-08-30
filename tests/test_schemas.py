@@ -87,6 +87,72 @@ def test_normalise_does_not_repair_bad_ohlc():
     assert out.loc[2, HIGH] == 0.0
 
 
+# --- normalisation contract: value preservation --------------------------
+
+
+def test_normalise_preserves_every_price_exactly():
+    """Exact equality, not tolerance: normalisation must not alter values."""
+    frame = make_ohlcv(200, seed=11)
+    out = normalise(frame.copy())
+    for col in (OPEN, HIGH, LOW, CLOSE):
+        assert out[col].tolist() == frame[col].tolist()
+
+
+def test_normalise_preserves_volume_exactly():
+    frame = make_ohlcv(200, seed=12)
+    out = normalise(frame.copy())
+    assert out[VOLUME].tolist() == frame[VOLUME].tolist()
+
+
+def test_normalise_does_not_fabricate_missing_volume():
+    """Regression: volume was filled with 0, asserting 'no trades occurred'."""
+    frame = make_ohlcv(5)
+    frame[VOLUME] = frame[VOLUME].astype("Int64")
+    frame.loc[2, VOLUME] = pd.NA
+    out = normalise(frame)
+    assert pd.isna(out.loc[2, VOLUME]), "missing volume must stay missing"
+    assert out.loc[2, VOLUME] is not 0  # noqa: F632 - explicit intent
+
+
+def test_normalise_preserves_already_missing_prices():
+    """Genuine source missingness passes through for the validator to report."""
+    frame = make_ohlcv(5)
+    frame.loc[3, CLOSE] = float("nan")
+    out = normalise(frame)
+    assert pd.isna(out.loc[3, CLOSE])
+
+
+def test_normalise_refuses_to_coerce_unparseable_price():
+    """Regression: 'bad' silently became NaN, disguising a source defect."""
+    frame = make_ohlcv(5)
+    frame[OPEN] = frame[OPEN].astype(object)
+    frame.loc[1, OPEN] = "bad"
+    with pytest.raises(SchemaError, match="not parseable as numeric"):
+        normalise(frame)
+
+
+def test_normalise_refuses_to_coerce_unparseable_volume():
+    frame = make_ohlcv(5)
+    frame[VOLUME] = frame[VOLUME].astype(object)
+    frame.loc[1, VOLUME] = "lots"
+    with pytest.raises(SchemaError, match="not parseable as numeric"):
+        normalise(frame)
+
+
+def test_coercion_error_names_the_offending_value():
+    """The error must identify what was wrong, not just that something was."""
+    frame = make_ohlcv(5)
+    frame[HIGH] = frame[HIGH].astype(object)
+    frame.loc[2, HIGH] = "N/A"
+    with pytest.raises(SchemaError, match="N/A"):
+        normalise(frame)
+
+
+def test_volume_dtype_is_nullable_int64():
+    out = normalise(make_ohlcv(5))
+    assert str(out[VOLUME].dtype) == "Int64"
+
+
 def test_assert_canonical_rejects_wrong_column_order():
     frame = make_ohlcv(5)[[VOLUME, TS, OPEN, HIGH, LOW, CLOSE]]
     with pytest.raises(SchemaError, match="Column mismatch"):
