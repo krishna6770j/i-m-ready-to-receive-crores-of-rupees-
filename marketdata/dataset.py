@@ -70,7 +70,9 @@ share one ``data_digest`` while producing different validation evidence.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from datetime import time
 from enum import Enum
 
 import pandas as pd
@@ -120,12 +122,81 @@ class ValidationPolicy:
     WHAT the data is (see the module docstring). Two builds of the same
     frame + identity under different policies may share one digest while
     differing in validation evidence.
+
+    Self-validating and deeply stable: type hints alone are not enforcement
+    (a caller can pass ``ValidationPolicy(session_window=[...])`` despite
+    the ``tuple`` annotation, or a duck-typed object presenting the same
+    attribute names), so ``__post_init__`` rejects malformed values outright
+    and normalises ``session_window`` into a genuinely new, immutable
+    ``tuple`` -- never the caller's own mutable list/tuple object -- so a
+    later external mutation of whatever the caller passed in can never
+    reach a policy already bound to a ``ValidatedDataset``.
     """
 
     expected_interval_minutes: int | None = None
     sigma_threshold: float = 10.0
-    session_window: tuple | None = None
+    session_window: tuple[time, time] | None = None
     max_session_gap_days: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.expected_interval_minutes is not None:
+            value = self.expected_interval_minutes
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    "expected_interval_minutes must be None or a positive "
+                    f"int, got {value!r} ({type(value).__name__})"
+                )
+            if value <= 0:
+                raise ValueError(
+                    f"expected_interval_minutes must be positive, got {value!r}"
+                )
+
+        sigma = self.sigma_threshold
+        if not isinstance(sigma, (int, float)) or isinstance(sigma, bool):
+            raise TypeError(
+                f"sigma_threshold must be a real number, got {sigma!r} "
+                f"({type(sigma).__name__})"
+            )
+        sigma = float(sigma)
+        if not math.isfinite(sigma) or sigma <= 0:
+            raise ValueError(
+                f"sigma_threshold must be finite and positive, got "
+                f"{self.sigma_threshold!r}"
+            )
+        object.__setattr__(self, "sigma_threshold", sigma)
+
+        if self.max_session_gap_days is not None:
+            gap = self.max_session_gap_days
+            if not isinstance(gap, (int, float)) or isinstance(gap, bool):
+                raise TypeError(
+                    "max_session_gap_days must be None or a real number, "
+                    f"got {gap!r} ({type(gap).__name__})"
+                )
+            gap = float(gap)
+            if not math.isfinite(gap) or gap <= 0:
+                raise ValueError(
+                    "max_session_gap_days must be finite and positive, got "
+                    f"{self.max_session_gap_days!r}"
+                )
+            object.__setattr__(self, "max_session_gap_days", gap)
+
+        if self.session_window is not None:
+            try:
+                window = tuple(self.session_window)
+            except TypeError as exc:
+                raise TypeError(
+                    "session_window must be None or exactly two "
+                    f"datetime.time values, got {self.session_window!r}"
+                ) from exc
+            if len(window) != 2 or not all(isinstance(t, time) for t in window):
+                raise TypeError(
+                    "session_window must be None or exactly two "
+                    f"datetime.time values, got {self.session_window!r}"
+                )
+            # A NEW tuple, not the caller's own list/tuple object: severs
+            # the reference so a later mutation of the caller's original
+            # container can never reach this policy.
+            object.__setattr__(self, "session_window", window)
 
 
 class ValidatedDataset:
@@ -220,7 +291,21 @@ class ValidatedDataset:
         never accepted separately, so the validation report's own symbol/
         resolution can never diverge from the identity this object is bound
         to.
+
+        Raises ``TypeError`` if ``validation_policy`` is not an actual
+        ``ValidationPolicy`` instance -- a duck-typed object presenting the
+        same attribute names is rejected outright, since only
+        ``ValidationPolicy`` itself validates and freezes its own fields
+        (``__post_init__``); accepting a lookalike would let a caller store
+        a mutable object that no longer describes, after the fact, the
+        policy that actually produced the validation report.
         """
+        if not isinstance(validation_policy, ValidationPolicy):
+            raise TypeError(
+                "validation_policy must be an actual ValidationPolicy "
+                f"instance, got {type(validation_policy).__name__}."
+            )
+
         canonicalisation = canonicalise(raw_frame)
 
         blockers = [

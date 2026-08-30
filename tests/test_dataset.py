@@ -10,6 +10,8 @@ exact raw frame it is given.
 from __future__ import annotations
 
 import dataclasses
+import datetime
+import math
 
 import pandas as pd
 import pytest
@@ -170,7 +172,126 @@ def test_adversarial_build_valid_then_mutate_caller_raw_frame_into_invalid():
     assert ds.validation.is_usable is True
 
 
-# --- ValidationPolicy ---------------------------------------------------------
+# --- ValidationPolicy: self-validation and deep immutability ----------------
+
+
+def test_fake_mutable_policy_object_is_rejected():
+    # A duck-typed lookalike presenting the same attribute names is not an
+    # actual ValidationPolicy, so build() must reject it outright rather
+    # than store an object it never validated or froze.
+    class FakePolicy:
+        expected_interval_minutes = 1
+        sigma_threshold = 10.0
+        session_window = None
+        max_session_gap_days = None
+
+    with pytest.raises(TypeError):
+        ValidatedDataset.build(
+            _valid_rows(), identity=_identity(), validation_policy=FakePolicy()
+        )
+
+
+def test_session_window_list_cannot_leak_mutable_state():
+    mutable_window = [datetime.time(9, 15), datetime.time(15, 30)]
+    policy = ValidationPolicy(session_window=mutable_window)
+    assert isinstance(policy.session_window, tuple)
+
+    mutable_window.append(datetime.time(16, 0))  # mutate the caller's own list
+
+    assert policy.session_window == (datetime.time(9, 15), datetime.time(15, 30))
+
+
+def test_mutation_of_caller_owned_input_after_policy_creation_does_not_change_policy():
+    mutable_window = [datetime.time(9, 15), datetime.time(15, 30)]
+    policy = ValidationPolicy(session_window=mutable_window)
+    ds = ValidatedDataset.build(
+        _valid_rows(), identity=_identity(), validation_policy=policy
+    )
+
+    mutable_window[0] = datetime.time(0, 0)
+    mutable_window.append("corrupted")
+
+    assert ds.validation_policy.session_window == (
+        datetime.time(9, 15),
+        datetime.time(15, 30),
+    )
+
+
+def test_expected_interval_minutes_zero_rejected():
+    with pytest.raises(ValueError):
+        ValidationPolicy(expected_interval_minutes=0)
+
+
+def test_expected_interval_minutes_negative_rejected():
+    with pytest.raises(ValueError):
+        ValidationPolicy(expected_interval_minutes=-1)
+
+
+def test_expected_interval_minutes_non_integer_rejected():
+    with pytest.raises(TypeError):
+        ValidationPolicy(expected_interval_minutes=1.5)
+
+
+def test_expected_interval_minutes_bool_rejected():
+    with pytest.raises(TypeError):
+        ValidationPolicy(expected_interval_minutes=True)
+
+
+def test_sigma_threshold_zero_or_negative_rejected():
+    with pytest.raises(ValueError):
+        ValidationPolicy(sigma_threshold=0.0)
+    with pytest.raises(ValueError):
+        ValidationPolicy(sigma_threshold=-5.0)
+
+
+def test_sigma_threshold_nan_or_inf_rejected():
+    with pytest.raises(ValueError):
+        ValidationPolicy(sigma_threshold=math.nan)
+    with pytest.raises(ValueError):
+        ValidationPolicy(sigma_threshold=math.inf)
+
+
+def test_max_session_gap_days_zero_or_negative_rejected():
+    with pytest.raises(ValueError):
+        ValidationPolicy(max_session_gap_days=0.0)
+    with pytest.raises(ValueError):
+        ValidationPolicy(max_session_gap_days=-2.0)
+
+
+def test_max_session_gap_days_nan_or_inf_rejected():
+    with pytest.raises(ValueError):
+        ValidationPolicy(max_session_gap_days=math.nan)
+    with pytest.raises(ValueError):
+        ValidationPolicy(max_session_gap_days=math.inf)
+
+
+def test_malformed_session_window_rejected():
+    with pytest.raises(TypeError):
+        ValidationPolicy(session_window=(datetime.time(9, 15),))  # only one
+    with pytest.raises(TypeError):
+        ValidationPolicy(
+            session_window=(datetime.time(9, 15), datetime.time(15, 30), datetime.time(16, 0))
+        )  # three
+    with pytest.raises(TypeError):
+        ValidationPolicy(session_window=("09:15", "15:30"))  # not datetime.time
+    with pytest.raises(TypeError):
+        ValidationPolicy(session_window=42)  # not iterable of the right shape
+
+
+def test_invalid_policy_values_fail_before_validator_calculations():
+    # Construction itself must raise -- no validate() call, no build() call,
+    # ever gets a chance to run against a malformed policy.
+    with pytest.raises((ValueError, TypeError)):
+        ValidationPolicy(expected_interval_minutes=-1)
+
+
+def test_valid_policy_still_produces_expected_validation_behavior():
+    policy = ValidationPolicy(
+        expected_interval_minutes=1, sigma_threshold=8.0, max_session_gap_days=3.0
+    )
+    ds = ValidatedDataset.build(_valid_rows(), identity=_identity(), validation_policy=policy)
+    assert ds.market_data_validity is MarketDataValidity.VALID
+    assert ds.validation_policy == policy
 
 
 def test_validation_policy_is_frozen():
