@@ -28,7 +28,7 @@ design except where quoting a defect.
 
 | Dimension | Values | Meaning | Derived from |
 |---|---|---|---|
-| `ArtifactIntegrity` | INTACT / BROKEN | Stored bytes match the recorded data digest; the provenance envelope binds to this generation and namespace | data + envelope |
+| `ArtifactIntegrity` | INTACT / BROKEN | The **loaded logical dataset** canonicalises to the recorded `data_digest`, the envelope canonicalises to `provenance_digest`, pointer/envelope integrity holds, and generation identity/location agree. See §2.3 — this is **not** byte-identity of `data.parquet` | data + envelope |
 | `SchemaValidity` | VALID / INVALID | Frame conforms to the canonical schema and declared `schema_version` | data |
 | `MarketDataValidity` | VALID / INVALID | No ERROR-severity validation issue (OHLC rules, finiteness, duplicates, ordering) | data |
 | `AcquisitionRequestStatus` | see §11.1 | **Only** whether broker requests returned without error | provenance |
@@ -41,7 +41,36 @@ design except where quoting a defect.
 | `GenerationFreshness` | **not modelled** | See §5 — cannot be established | — |
 | `ResearchReadiness` | READY / NOT_READY *(per policy)* | Whether a specific experiment's `ResearchDataPolicy` is satisfied | all of the above |
 
-### 2.1 `TrustedDataset` — exact guarantee
+### 2.1 `ArtifactIntegrity` is logical, not byte-level
+
+`data_digest` is computed over the **canonical logical dataset** (§8.2), not over
+the raw `data.parquet` byte stream. Parquet embeds writer version, compression
+settings, row-group layout and column metadata, all of which can differ between
+runs without any observation differing.
+
+`ArtifactIntegrity = INTACT` therefore means:
+
+- the selected generation satisfies pointer and envelope integrity;
+- the loaded logical dataset canonicalises to the recorded `data_digest`;
+- the provenance envelope canonicalises to the recorded `provenance_digest`;
+- generation identity and location agree (§7).
+
+**It does not mean** every byte of `data.parquet` is identical to the file
+originally written.
+
+| Change to `data.parquet` | Outcome |
+|---|---|
+| Any change altering the decoded observations | **Detected** — `data_digest` differs |
+| Rewrite preserving exactly the same logical canonical dataset (recompression, different row-group layout, writer version) | **Not detected — accepted** |
+
+The second row is deliberate. Our scientific concern is the integrity of the
+observations, not of a particular serialisation of them, and treating a
+recompression as corruption would produce false alarms on any legitimate
+re-encode. **No raw-Parquet file digest is added**: byte-for-byte artifact
+identity has no demonstrated Phase-1 requirement, and adding a second digest
+would create a second thing to keep consistent for no scientific gain.
+
+### 2.2 `TrustedDataset` — exact guarantee
 
 > `ArtifactIntegrity = INTACT` **and** `SchemaValidity = VALID` **and**
 > `MarketDataValidity = VALID` **and** the acquisition provenance is
@@ -55,7 +84,7 @@ separate records and certifications.
 
 **A `TrustedDataset` is a sound artifact, not a research input.**
 
-### 2.2 `ResearchReadyDataset` — exact guarantee
+### 2.3 `ResearchReadyDataset` — exact guarantee
 
 > Constructed **only** from a `TrustedDataset` plus an explicit
 > `ResearchDataPolicy`, and only when every requirement the policy declares is
@@ -413,14 +442,31 @@ Baseline builds paths as `symbol.replace(":", "_").replace("/", "_")`. A `..`
 component would traverse.
 
 **Identifiers are never interpolated into paths.** Each of `source`, `symbol` and
-`resolution` maps to a **safe slug**: a restricted charset (`[A-Za-z0-9._-]`),
-every other byte percent-encoded, `.` and `..` rejected outright, empty rejected,
-length-capped, with a short digest suffix to guarantee slug uniqueness after
-encoding collisions. Absolute paths are impossible by construction because slugs
-contain no separator.
+`resolution` maps to a **safe slug**. The previous revision named a restricted
+alphabet *and* percent-encoding, which contradicted itself: `%` is not in
+`[A-Za-z0-9._-]`. Percent-encoding is withdrawn.
 
-**The original identifiers live in the envelope and the digest.** The slug is
-only a locator encoding and is never treated as identity.
+**Canonical mapping: readable prefix + digest suffix.**
+
+```
+slug = <sanitised_prefix> "-" <hex(sha256(utf8(identifier))[:8])>
+```
+
+- `sanitised_prefix` — the identifier's UTF-8 bytes with every character outside
+  `[A-Za-z0-9_-]` replaced by `_`, truncated to 32 characters. `.` is **excluded
+  from the alphabet**, so `.` and `..` components are impossible by construction
+  rather than by a rejection rule that could be forgotten.
+- `digest_suffix` — 16 hex characters, making the mapping collision-resistant
+  even when two identifiers sanitise to the same prefix.
+
+Properties, each satisfied by construction: the raw identifier is never a path
+component; no `/` or `\` can appear; no `.`/`..` component is possible; no
+absolute-path interpretation is possible; the mapping is deterministic and
+collision-resistant; component length is bounded at 49 characters.
+
+**The slug is one-way and decoding is never required.** The original identifiers
+live in the envelope and in the identity digest, and lookup goes through the
+envelope. **The slug is a locator only and is never treated as identity** (§8.1).
 
 ### 13.2 `CURRENT` pointer format
 
@@ -746,29 +792,76 @@ requiring interior gaps to block `TrustedDataset`.
 
 ### Layer A — trusted-artifact laundering
 
-None of these may produce a `TrustedDataset`: invalid frame · validation from a
-different frame · frame mutated after validation · source-order anomaly ·
-conflicting duplicate timestamps · unsupported schema field · extra positional
-broker field · manifest `requested_range` shortened to match sparse data ·
-manifest chunk failures removed · forged validation status · forged acquisition
-status · forged `forced` flag · forged data digest · provenance envelope modified
-without updating the pointer digest · pointer `integrity_id` modified · pointer
-naming a different valid generation · **malformed pointer** · **pointer with a
-traversal-shaped generation id** · **data/manifest copied into another generation
-directory** · **unknown `provenance_schema_version`** · manifest copied from
-another dataset · modified Parquet · missing manifest · `REQUESTS_PARTIAL` ·
-`REQUESTS_EMPTY` · `REQUESTS_FAILED` · **valid dataset written through the force
-path** · **forced manifest edited to `force=false`** · interrupted generation
-write · **`source`/`symbol` containing path-traversal text** · ambiguous string
-containing encoding delimiters · wrong expected source / symbol / resolution
-locator.
+**Must NOT produce a `TrustedDataset`:** invalid frame · validation from a
+different frame · frame mutated after validation · conflicting duplicate
+timestamps · row removed during canonicalisation · value changed during
+canonicalisation · unsupported schema field · extra positional broker field ·
+manifest `requested_range` shortened to match sparse data · manifest chunk
+failures removed · forged validation status · forged acquisition status · forged
+`forced` flag · forged data digest · provenance envelope modified without
+updating the pointer digest · **unknown `provenance_schema_version`** ·
+**data/manifest copied into another generation directory** · manifest copied from
+another dataset · Parquet modified so the decoded observations differ · missing
+manifest · `REQUESTS_PARTIAL` · `REQUESTS_EMPTY` · `REQUESTS_FAILED` · **valid
+dataset written through the force path** · **forced manifest edited to
+`force=false`** · interrupted generation write · **`source`/`symbol` containing
+path-traversal text** · ambiguous string containing encoding-delimiter characters
+· wrong expected source / symbol / resolution locator.
 
-A genuinely sound artifact must still succeed — the test must prove the gate is
-not simply refusing everything.
+**Pointer cases — must be rejected:**
 
-**Explicitly recorded as NOT covered:** `CURRENT` replaced by an *older valid*
-pointer (§5). The test asserts this is **accepted**, documenting the known limit
-rather than pretending otherwise.
+| | Case |
+|---|---|
+| A | pointer `generation_id` does not match the target generation's envelope |
+| B | pointer `integrity_id` does not match the target generation |
+| C | pointer names a generation in the wrong namespace |
+| D | pointer malformed (unknown field, bad JSON, wrong `pointer_version`) |
+| E | pointer contains an invalid UUID or path-shaped material |
+| F | pointer names a generation whose data/envelope does not satisfy its own `integrity_id` |
+
+**Pointer case that must be ACCEPTED — known limitation:**
+
+| | Case |
+|---|---|
+| G | `CURRENT` replaced wholesale by an older **valid** pointer carrying the correct `generation_id` and `integrity_id` for an older complete trusted generation |
+
+Case G is generation rollback (§5) and is deliberately out of scope in Phase 1.
+The test asserts G **succeeds**, so the limitation is encoded in the suite rather
+than left as prose that could drift. **No other section of this document may
+imply case G is detectable.**
+
+**Must be ACCEPTED (see §24.1):** an otherwise sound dataset whose source arrived
+out of order and was losslessly stable-sorted.
+
+**A genuinely sound artifact must still succeed** — the test must prove the gate
+discriminates rather than simply refusing everything.
+
+### 24.1 Source-order anomaly — resolved
+
+The previous revision listed "source-order anomaly" as a Layer A failure while
+§14 classified a stable sort as `INFO, recorded`. That was a contradiction.
+
+**Resolution — the §14 classification governs.** An otherwise valid dataset **may**
+become a `TrustedDataset` after a lossless stable sort of an out-of-order source,
+provided all of the following hold:
+
+- the sort is deterministic;
+- no observation is removed;
+- no value changes;
+- the source-ordering anomaly and `rows_reordered` are recorded in the
+  canonicalisation snapshot;
+- that snapshot is inside the provenance envelope and therefore integrity-bound.
+
+If any of those fails, the relevant §14 TRUST BLOCKER applies instead (row
+removal and value change are both blockers).
+
+This is **not** a silent repair: the evidence that the source was disordered is
+permanently bound to the generation and cannot be edited away without breaking
+`provenance_digest`.
+
+`ResearchDataPolicy` may declare `require_pristine_source_order=True`, in which
+case Layer B rejects the dataset for that experiment while the artifact itself
+remains sound.
 
 ### Layer B — research-readiness laundering
 
@@ -780,10 +873,14 @@ requiring `CERTIFIED` · `ContinuityCertification = FAILED` · huge interior gap
 requested-window coverage below the policy minimum · `ReproducibilityCertification
 = NOT_CERTIFIED` under a policy requiring it · **actual environment digest not
 satisfying the expected environment policy** · locator source/symbol/resolution
-not matching policy expectations.
+not matching policy expectations · **source-order anomaly recorded in ingestion
+provenance, under a policy declaring `require_pristine_source_order=True`**.
 
 The same artifact must be accepted by a policy that does not require those
-certifications — proving the boundary discriminates rather than blocks.
+certifications — proving the boundary discriminates rather than blocks. In
+particular the stable-sorted dataset from §24.1 is a valid `TrustedDataset`, is
+rejected by a policy requiring pristine source order, and is accepted by one that
+does not.
 
 ---
 
@@ -833,7 +930,9 @@ that standard carries forward.
 | Pointer malformed / unknown field / bad uuid | `PointerFormatError` | n/a |
 | Manifest missing / unparseable / unknown fields | `ProvenanceSchemaError` | returns data |
 | Unknown `provenance_schema_version` | `ProvenanceSchemaError` | returns data |
-| Parquet tampered | `IntegrityError` | returns data |
+| Parquet modified so decoded observations differ | `IntegrityError` | returns data |
+| Parquet re-encoded preserving the identical logical dataset | **succeeds — not detected, accepted (§2.1)** | returns data |
+| Source arrived out of order, losslessly stable-sorted | **succeeds**; anomaly recorded; policy may reject (§24.1) | returns data |
 | **Manifest tampered, self-consistent** | **`ProvenanceTampered`** (envelope digest, **not** revalidation) | returns data |
 | Both tampered consistently | `GenerationIntegrityError` | returns data |
 | Generation dir copied elsewhere | `GenerationLocationMismatch` | returns data |
@@ -910,7 +1009,34 @@ manager approval. **STOP** after each commit for independent GitHub inspection.
 
 ---
 
-## 30. Non-goals
+## 30. Architecture freeze for implementation
+
+**This document is the Phase-1 implementation contract.**
+
+- Implementation may not silently deviate from it. Code that disagrees with this
+  document is a defect in one of the two, and which one must be decided
+  deliberately.
+- If implementation discovers a contradiction, an impossibility, or a better
+  design, **STOP and amend this document first**, then implement. Do not resolve
+  the disagreement in code and reconcile the design afterwards.
+- Priority order for every ambiguity: **DATA INTEGRITY > REPRODUCIBILITY >
+  AUDITABILITY > SAFETY > CONVENIENCE.**
+- Every implementation unit requires: tests written first, implementation, the
+  full suite, targeted adversarial tests, one logical commit, a push to the
+  review branch, and **manager review before the next unit**.
+- `phase1-trust-hardening` remains the only development branch. Nothing may
+  remain only on a local machine.
+- `main` remains the manager-approved baseline. No direct pushes, no
+  self-merges.
+- CI passing is **not** a substitute for manager review.
+
+**Phase 1 is not complete.** This freeze covers the architecture only. Phase 1
+remains REJECTED until the implementation exists, is tested, is reviewed, and
+real market data has been acquired and validated through this pipeline.
+
+---
+
+## 31. Non-goals
 
 Not in Phase 1: strategy logic, indicators, signal generation, backtesting,
 optimisation, walk-forward, Monte Carlo, TradingView or Pine integration,
