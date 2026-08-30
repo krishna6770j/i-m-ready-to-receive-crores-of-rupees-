@@ -1,7 +1,7 @@
 # Phase 1 — Trusted Data Architecture
 
-Design specification. **No production code, tests, dependencies or README changes
-accompany this document.** Implementation is not authorised.
+Design specification. **No production code, tests, dependencies, README or CI
+changes accompany this document.** Implementation is not authorised.
 
 ---
 
@@ -10,600 +10,700 @@ accompany this document.** Implementation is not authorised.
 | | |
 |---|---|
 | Baseline commit | `e74d333832216d4c8e8ad77a099993e5323e657d` |
-| Branch | `phase1-trust-hardening`, branched from the baseline |
-| Manager verdict at baseline | Phase 1 REJECTED; Phase 2 NOT AUTHORISED; live FYERS NOT AUTHORISED |
+| Branch | `phase1-trust-hardening` |
+| Manager verdict | Phase 1 REJECTED; Phase 2 NOT AUTHORISED; live FYERS NOT AUTHORISED |
 | Tests at baseline | 176 passing |
 
-Every claim below was checked against the code at this commit. Where a previous
-design assumption proved false, that is stated explicitly rather than quietly
-corrected.
+Every claim was checked against code at this commit. Where an earlier revision
+of this document was wrong, the correction is stated plainly rather than layered
+over.
 
 ---
 
-## 2. Problem statement
+## 2. Glossary of certifications
 
-The central invariant is not established:
+The previous revision used *valid*, *usable*, *trusted*, *authoritative*,
+*complete*, *reproducible* with overlapping meanings. Each term below now has
+exactly one meaning. **There is no single `is_authoritative` boolean.**
 
-> An invalid, incomplete, tampered, or incorrectly-described dataset must never
-> be accepted as authoritative.
+| Dimension | Values | Meaning | Derivable from candles alone? |
+|---|---|---|---|
+| `ArtifactIntegrity` | INTACT / BROKEN | Stored bytes match the recorded data digest, and the provenance envelope binds to this generation | no — needs the envelope |
+| `SchemaValidity` | VALID / INVALID | Frame conforms to the canonical schema and declared `schema_version` | yes |
+| `MarketDataValidity` | VALID / INVALID | No ERROR-severity validation issue (OHLC rules, finiteness, duplicates, ordering) | yes |
+| `AcquisitionEvidenceIntegrity` | INTACT / BROKEN | Acquisition snapshot is envelope-bound and internally consistent | no — historical claim |
+| `ObservedCoverage` | a *record*, not a grade | Observed first/last dates, boundary-date presence, containment in the request window | yes, as fact |
+| `ContinuityCertification` | CERTIFIED / NOT_CERTIFIED / FAILED | Whether interior gaps are explained | needs a calendar |
+| `SessionCertification` | CERTIFIED / NOT_CERTIFIED / FAILED | Whether expected sessions and bar density are present | needs a calendar |
+| `ReproducibilityCertification` | CERTIFIED / NOT_CERTIFIED | Whether the producing environment is pinned and clean | no |
+| `Namespace` | TRUSTED / FORCED | Structural provenance state, from storage layout | no |
 
-Twelve independently confirmed defects share one root cause: **the system trusts
-assertions instead of deriving facts.**
+**`TrustedDataset` guarantees exactly:** `ArtifactIntegrity = INTACT`,
+`SchemaValidity = VALID`, `MarketDataValidity = VALID`,
+`AcquisitionEvidenceIntegrity = INTACT`, locator identity matches, and
+`Namespace = TRUSTED`.
+
+**`TrustedDataset` explicitly does NOT guarantee:** continuity, session
+coverage, bar density, reproducibility, or that the broker returned the
+instrument requested (§16). Those travel *on* the object as separate
+certifications, and a consumer states which it requires.
+
+This resolves the previous contradiction where an arbitrary gap threshold
+decided whether the storage artifact itself was "trusted". Artifact
+trustworthiness and market-history completeness are now different questions.
+
+---
+
+## 3. Problem statement
+
+Sixteen confirmed defects share one root cause: the system trusts assertions
+instead of deriving facts. But — correcting the previous revision — **not every
+fact is derivable**, and the design must say which are which.
 
 | # | Defect at baseline | Evidence |
 |---|---|---|
-| 1 | `store.write()` accepts a frame and a report as separate arguments and never checks the report describes that frame | Invalid frame + valid frame's report persists with `validation_status="valid"` |
-| 2 | `is_authoritative` forgeable by editing `validation_status`, `fetch_status`, `forced` | Edited manifest yields `is_authoritative=True` on genuinely invalid data |
-| 3 | Acquisition completeness derived from `failed_chunks == []` | 3 candles stored as authoritative answer to a 1-year request |
-| 4 | `ABSURD_GAP_DAYS = 30` is a magic number; a 29-day hole is WARNING-only | 3/7/14/20/29-day gaps all `usable=True` |
-| 5 | **Source anomalies erased before validation** | `normalise()` sorts before the validator can observe source ordering |
-| 6 | Extra source columns silently dropped | `oi`, `vwap` vanish with no record; contradicts the README |
-| 7 | `content_hash` uses `%.10g` despite a docstring claiming `repr` | 1e-9 price change hashes identically |
+| 1 | `store.write()` takes frame and report separately, never checking they correspond | Invalid frame + valid frame's report persists as `validation_status="valid"` |
+| 2 | `is_authoritative` forgeable via `validation_status`/`fetch_status`/`forced` | Edited manifest yields `True` on invalid data |
+| 3 | Completeness derived from `failed_chunks == []` | 3 candles stored as authoritative answer to a 1-year request |
+| 4 | `ABSURD_GAP_DAYS = 30` magic number; 29-day hole is WARNING-only | 3/7/14/20/29-day gaps all `usable=True` |
+| 5 | Source anomalies erased before validation | `normalise()` sorts before the validator can observe source ordering |
+| 6 | Extra source columns silently dropped | `oi`, `vwap` vanish; contradicts the README |
+| 7 | `content_hash` uses `%.10g` despite a `repr` docstring | 1e-9 price change hashes identically |
 | 8 | Digest excludes source, symbol, resolution | Different instruments with equal candles collide |
 | 9 | `read()` verifies nothing | Tampered Parquet returned silently |
 | 10 | Two-file write is not transactional | Manifest failure leaves an orphan Parquet |
 | 11 | `--force` overwrites the authoritative dataset in place | Good data silently replaced |
-| 12 | Redaction reads only the *current* env value | A rotated-out token leaks |
+| 12 | Redaction reads only the current env value | A rotated-out token leaks |
+| 13 | `probe_earliest_available()` binary-searches a non-monotonic predicate | Holiday/outage window empty while earlier data exists |
+| 14 | Broker error text embedded in exceptions and printed to stdout | `historical.py` builds `detail` from raw broker `message`; four scripts `print(f"…{exc}")` |
+| 15 | `write_token_to_env()` validates nothing | A newline in a token injects `.env` lines |
+| 16 | Config coerces falsey values | `lot_size=int(lot_size) if lot_size else 1` turns `0` into `1` |
 
-Plus four found during this design review:
+---
 
-| # | Defect | Evidence |
+## 4. Threat model
+
+**In scope.** Accidental manifest edits; stale or partially-written files;
+process death mid-write; inconsistent output from future automation; manifests
+copied between datasets; operator mistakes; malformed or hostile *broker
+responses*; our own refactoring errors.
+
+**Out of scope.** A malicious actor who controls the machine and source tree.
+Such an actor can recompute every digest and rewrite the pointer, and the design
+says so explicitly rather than implying protection it does not provide.
+
+**No asymmetric signing.** The generation-integrity envelope (§7) detects every
+in-scope failure. A key on the same machine would not raise the bar against the
+out-of-scope actor.
+
+---
+
+## 5. Three classes of fact
+
+The previous revision's blanket "derive, don't trust" was wrong. Correcting it:
+
+| Class | Examples | Protection |
 |---|---|---|
-| 13 | `probe_earliest_available()` binary-searches a **non-monotonic** predicate | A holiday/outage window is empty while earlier and later data exist |
-| 14 | Broker-controlled error text is embedded in exceptions and printed to stdout | `historical.py` builds `detail` from the raw broker `message`; four scripts `print(f"...{exc}")` |
-| 15 | `write_token_to_env()` performs no validation | A token containing a newline injects arbitrary `.env` lines |
-| 16 | Config coerces falsey values | `lot_size=int(lot_size) if lot_size else 1` turns `0` and `""` into `1` |
+| **Data-derived** | OHLC validity, schema conformance, row count, observed first/last timestamp, data digest | **Recomputed** from the stored data at every use |
+| **Provenance evidence** | requested range, chunks requested/failed/empty, broker attribution, raw column inventory, canonicalisation anomalies | **Cannot be recomputed from candles.** Integrity-bound to the generation via the envelope digest |
+| **Operator declarations** | `forced`, `force_reason`, notes | Integrity-bound, plus **structural** demotion via namespace (§10) |
+
+The manager's counterexample is decisive and is now handled: stored data
+`Jan 1 – Jan 3`, actual request `Jan 1 – Dec 31`, manifest edited so
+`requested_to = Jan 3`, `failed_chunks = []`, `acquisition = edge_complete`.
+Every field is internally self-consistent and no amount of OHLCV revalidation
+recovers the original request. **Only the envelope digest detects this**, because
+editing the manifest changes the provenance digest, which no longer matches the
+generation-integrity id recorded in the pointer.
 
 ---
 
-## 3. Threat model
+## 6. Trust transitions and types
 
-**In scope.** Accidental manifest edits ("I'll just set this to valid"); stale or
-partially-written files; a process dying mid-write; inconsistent output from
-future automation; manifests copied between datasets; operator mistakes;
-malformed or hostile *broker responses*; our own refactoring errors.
+| Type | Constructed by | Guarantees | Does NOT guarantee | Phase 2 may consume |
+|---|---|---|---|---|
+| `RawObservations` | adapter parse | Shape matches **the adapter's currently configured parse contract** | That the contract matches live broker behaviour — that remains ASSUMED, never LIVE-VERIFIED | no |
+| `CanonicalDataset` | `canonicalise()` | Deterministic canonical form **plus** transformation and source-anomaly evidence | Validity | no |
+| `ValidatedDataset` | `ValidatedDataset.build()` | Canonical form, identity digest and validation evidence produced from that exact data | That the data stays unmutated afterwards | no |
+| `UnverifiedDataset` | `store.read_unverified()` | Bytes were loaded from disk | Everything else | **no** |
+| `TrustedDataset` | `store.read_trusted()` | The five properties in §2 | Continuity, session coverage, reproducibility, instrument correctness | **yes — the only permitted input** |
 
-**Out of scope.** An adversary who controls the machine and the source tree.
-Anyone able to rewrite a manifest can equally rewrite `validator.py`, so a
-signing key stored on the same machine would add ceremony without security.
-
-**Consequence: no cryptographic signing.** Integrity is achieved by making the
-reader *derive* every gating fact rather than read it. This is strictly more
-robust against the in-scope threats than a signature would be, because it also
-catches inconsistency that was never malicious.
+`ADAPTER-CONTRACT-VALID` and `LIVE-BROKER-VERIFIED` are distinct labels
+throughout. Nothing in this repository is currently the latter.
 
 ---
 
-## 4. Trust transitions and type boundaries
-
-Five types, each corresponding to a genuine trust transition. No type exists
-merely for naming.
-
-| Type | Constructed by | Guarantees | Explicitly does NOT guarantee | Serialisable | Phase 2 may consume |
-|---|---|---|---|---|---|
-| `RawObservations` | adapter parse | Shape matches the source contract | Ordering, uniqueness, validity | No | No |
-| `CanonicalDataset` | `canonicalise()` | Deterministic canonical form **plus** a record of every transformation applied | Validity | No | No |
-| `ValidatedDataset` | `ValidatedDataset.build()` | Canonical form, identity digest, and validation evidence produced *from that exact data* | That the data is still unmutated *later* | No (`__reduce__` raises) | No |
-| `UnverifiedDataset` | `store.read_unverified()` | Bytes were loaded from disk | Everything else | n/a | **No** |
-| `TrustedDataset` | `store.read_trusted()` | Every §14 invariant re-derived at read time | Session coverage or bar density without a calendar | n/a | **Yes — the only permitted input** |
-
----
-
-## 5. Raw ingestion integrity (manager finding §2)
-
-**Confirmed defect.** `from_fyers_candles()` → `normalise()` sorts by timestamp
-before the validator runs. An out-of-order FYERS response is therefore silently
-repaired, and `TS_NOT_SORTED` can only ever fire on a hand-constructed frame —
-never on the production path. The same applies to any transformation
-canonicalisation performs.
-
-**Invariant.**
-
-> Canonicalisation may produce a deterministic representation, but it may never
-> erase evidence that the source delivered anomalous structure.
-
-**Chosen design: option B**, canonicalisation returns evidence alongside data.
+## 7. Generation integrity envelope
 
 ```
-canonicalise(raw) -> CanonicalisationResult(
-    frame,                  # canonical
-    transformations,        # what was done, deterministically
-    source_anomalies,       # what the source got wrong
-)
+data_digest        = SHA256( canonical encoding of identity + observations )   [§9]
+provenance_digest  = SHA256( canonical encoding of the provenance envelope )
+generation_id      = ULID (128-bit, content-independent)                       [§12]
+integrity_id       = SHA256( data_digest || provenance_digest )
 ```
 
-Option A (validate before normalising) was rejected because it requires a second
-validator operating on non-canonical input, doubling the rules that must stay in
-sync. Option B keeps one validator and makes the transformation itself
-auditable.
+The **provenance envelope** contains, in canonical encoded form: identity
+(`schema_version`, `source`, `symbol`, `resolution`); the acquisition snapshot
+(§11); the canonicalisation snapshot (§14); operator declarations (`forced`,
+`force_reason`); and the environment snapshot (§20).
 
-`source_anomalies` records, at minimum: source row count, source column
-inventory, whether rows arrived out of order (and how many inversions),
-duplicate timestamps present at source, extra columns seen, timezone conversion
-applied, dtype conversions applied, rows reordered, rows removed, values
-changed, columns preserved or discarded.
+The `CURRENT` pointer records `generation_id` **and** `integrity_id`. Therefore:
 
-Sorting remains valid canonicalisation. **Whether the source required sorting is
-provenance**, and it will be recorded and carried into the manifest.
+| Accidental change | Detected because |
+|---|---|
+| Parquet edited | `data_digest` changes → `integrity_id` mismatch |
+| Manifest edited (any field) | `provenance_digest` changes → mismatch |
+| Manifest and Parquet edited consistently | `integrity_id` still mismatches the pointer |
+| Manifest copied from another dataset | Both digests mismatch |
+| Pointer edited to another generation | That generation's `integrity_id` will not match the recorded one |
 
----
-
-## 6. Canonicalisation contract
-
-Permitted: column selection and ordering per the schema policy; dtype conversion
-that preserves values exactly; timezone conversion preserving the instant;
-deterministic stable sort by timestamp.
-
-Forbidden: substituting missing values; fabricating volume; interpolating;
-coercing unparseable source values into `NaN`; dropping rows; discarding columns
-without a record.
-
-Already fixed at baseline and to be preserved: volume is nullable `Int64` so
-missing volume stays missing; unparseable values raise `SchemaError` naming the
-offending value.
+Defeating this requires recomputing both digests *and* rewriting the pointer —
+which is precisely the out-of-scope actor. **Stated explicitly: this is
+tamper-evidence against accidents and inconsistency, not against a malicious
+user.**
 
 ---
 
-## 7. Schema evolution policy (manager finding §3)
+## 8. Dataset identity and locator verification
 
-**Confirmed defect.** `frame.loc[:, OHLCV_COLUMNS]` silently discards extra
-columns, contradicting the README.
-
-**Decision — (A) preserve, with (C) as the recorded fallback.** Applying
-DATA INTEGRITY > CONVENIENCE, silent discard is removed entirely.
-
-- The canonical six (`ts, open, high, low, close, volume`) remain the validated
-  core.
-- Recognised additional source fields are **preserved** in a namespaced
-  `x_<name>` region (`x_oi`, `x_vwap`), recorded in the manifest column
-  inventory, and **included in the identity digest**.
-- A field that cannot be preserved (unsupported dtype) is **discarded only with
-  an explicit provenance record naming it and the reason**.
-- `schema_version` is recorded in the manifest and is part of dataset identity.
-  A change in schema version changes the digest.
-
-This ordering matters: **the digest contract cannot be finalised before this
-policy**, because the policy determines what the digest covers. At baseline, an
-extra `oi` column hashes identically to its absence — verified.
-
----
-
-## 8. Dataset identity
-
-The earlier unqualified "iff" is retracted. Identity is defined as an
-equivalence relation over:
+Identity is an equivalence relation over:
 
 > **(schema_version, source, symbol, resolution, canonical observation sequence
-> including preserved extra columns)**
+> including preserved named extra columns)**
 
-| Attribute | In identity | Reasoning |
+In identity: schema version, source/vendor, symbol, resolution, canonical
+observation columns, preserved named extra columns, timestamp instant, row
+multiplicity, duplicate and conflicting timestamps, and adjustment state **when
+introduced** (none exists today; it must enter identity the day it does).
+
+Not in identity: timezone representation, row ordering, column ordering, dtype,
+acquisition range, manifest metadata.
+
+**Verified against what.** Correcting the previous revision, which said identity
+is "reverified" without saying against which reference: `source`, `symbol`,
+`resolution` and `schema_version` are **not** derivable from candles. They are
+verified as a three-way agreement:
+
+```
+read_trusted(source=..., symbol=..., resolution=...)
+        ↓
+   caller's locator   ==   envelope identity   ==   digest identity inputs
+```
+
+A manifest may never redefine the identity of the object being requested.
+Calling `read_trusted("fyers:history", "NSE:NIFTY50-INDEX", "1")` cannot return
+a generation whose manifest was edited to say `SBIN`: the locator disagrees with
+the envelope, and the envelope disagrees with the digest inputs.
+
+---
+
+## 9. Canonical encoding and digest
+
+The previous `IDENTITY | field | field` scheme is withdrawn: pipe and newline
+characters inside string values, column names containing separators, escape
+sequences, Unicode normalisation differences, and an NA sentinel colliding with
+a literal string all make it ambiguous once string columns exist.
+
+**Replacement: typed, length-prefixed binary encoding.** No delimiters, so no
+collision is possible.
+
+```
+field  := type_tag (1 byte) || length (8 bytes, big-endian) || payload
+stream := field*
+digest := SHA256(stream)
+```
+
+| Tag | Type | Payload |
 |---|---|---|
-| schema version | yes | Changes what the data means |
-| source / vendor | yes | Vendor differences are a research variable |
-| symbol | yes | Equal candles for different instruments are different datasets |
-| resolution | yes | Equal closes at 1-min and 5-min are different datasets |
-| canonical observation columns | yes | The data itself |
-| preserved extra columns | yes | Per §7; otherwise preservation is meaningless |
-| timestamp instant | yes | Identity is the instant, not its representation |
-| row multiplicity | yes | A duplicated row is a different sequence |
-| duplicate/conflicting timestamps | yes | Part of the sequence; also a validation error |
-| adjustment state | **yes, when introduced** | No adjustment logic exists today; it must enter identity the day it does |
-| timezone representation | no | Instant-preserving; IST canonical form is identity |
-| row ordering | no | Total deterministic sort; both orderings denote the same observations |
-| column ordering | no | Representation |
-| dtype | no | Values, not representation |
-| acquisition range | no | A property of the *request*, recorded in provenance |
-| manifest metadata | no | Evidence, not identity |
+| `0x01` | STR | UTF-8 bytes, **NFC-normalised** |
+| `0x02` | F64 | 8 bytes, IEEE-754 big-endian |
+| `0x03` | I64 | 8 bytes, two's complement big-endian |
+| `0x04` | NA | zero length |
+| `0x05` | NAN | zero length |
+| `0x06` | POSINF | zero length |
+| `0x07` | NEGINF | zero length |
+| `0x08` | TS | 8 bytes, int64 **nanoseconds** since Unix epoch, UTC |
 
-Consequences: identical candles under different symbols hash **differently**;
-the same candles requested over different date ranges hash **the same**; subset
-relationships are **not** derivable from digests, which is deliberate —
-coverage answers that question, not identity.
+Rules: `-0.0` is normalised to `+0.0` before encoding (IEEE signed zero is not a
+market distinction, and a zero price is invalid anyway); `NaN` and `±Inf` use
+their own tags rather than any float payload, so they can never collide with a
+finite value; missing volume uses `NA`, distinct from `I64(0)`; column names are
+encoded as `STR` fields in the header; column order is the canonical order, not
+the input order; row order is the canonical sort order.
+
+Stream layout: header fields (`schema_version`, `source`, `symbol`,
+`resolution`, column count, each column name) followed by each row's fields in
+canonical column order.
+
+Empty and one-row frames encode deterministically and differ from each other.
+
+Verified with an in-memory prototype: `24000.12` ≠ `24000.13`; a 1e-9 change
+differs (baseline `%.10g` says *same*); `0` ≠ `NA`; `NaN`, `+inf` all distinct;
+duplicate row added and row removed both differ; symbol, resolution and source
+each differ; while rows reversed, UTC-vs-IST representation, and reordered
+columns all match. `np.float64` subclasses `float`, so extracting the IEEE bytes
+is direct.
 
 ---
 
-## 9. Exact digest contract
+## 10. Forced generations — one semantic model
 
-The baseline digest is **not approved** as a binding mechanism: `%.10g`, and it
-omits source/symbol/resolution.
+The previous revision contradicted itself, claiming both that forced generations
+always fail trusted read and that forced data passing every check is
+"authoritative on its own merits". **The second claim is withdrawn.**
 
-Canonical serialisation, hashed with SHA-256:
+**Force is an operational provenance state, not a statement about the candles.**
 
 ```
-IDENTITY | schema_version | source | symbol | resolution
-COLUMNS  | <ordered canonical column inventory>
-<row>    | ts.isoformat() | f(open) | f(high) | f(low) | f(close) | vol | x_*…
+data_store/<source>/<symbol>/<resolution>/
+    trusted_generations/<generation_id>/   data.parquet + manifest.json
+    forced_generations/<generation_id>/    data.parquet + manifest.json
+    CURRENT                                pointer file
 ```
 
-- **Floats** — `float.hex()`. Verified: `np.float64` is a genuine subclass of
-  `float`, `.hex()` resolves directly and round-trips exactly.
-- **`-0.0` collapses to `+0.0`.** `float.hex()` distinguishes them, but IEEE
-  signed zero is not a market distinction and a zero price is invalid anyway.
-  Recorded as a deliberate choice, not an accident.
-- **`NaN` / `±inf`** — distinct stable tokens (`NaN`, `+Inf`, `-Inf`), never
-  collapsed together.
-- **Volume** — `NA` sentinel distinct from `0`.
-- **Timestamps** — ISO-8601 with UTC offset.
-- Serialised field-by-field, not via `to_csv`, removing dependence on pandas CSV
-  formatting.
+- `force=True` writes into `forced_generations/` and requires a non-empty
+  `force_reason`.
+- `CURRENT` can only ever name a generation in `trusted_generations/`.
+- `read_trusted()` **never traverses** `forced_generations/`.
+- Even perfectly valid candles written through the forced path remain forensic
+  until re-imported through the normal pipeline.
+- Reachable only via the forensic API with an explicit generation id.
 
-Verified distinctions with a prototype (in-memory only):
-
-| Must differ | Must match |
-|---|---|
-| 24000.12 vs 24000.13 | identical copy |
-| change at 1e-9 (baseline says *same*) | rows reversed |
-| volume `0` vs `NA` | UTC vs IST representation of the same instants |
-| `NaN`, `+inf` | columns reordered |
-| duplicate row added; row removed | change below double epsilon (not representable) |
-| timestamps shifted | |
-| different symbol / resolution / source | |
-
-Empty and one-row frames hash deterministically and differ from each other.
+Selection therefore does not depend on an editable boolean at all. The manifest
+still records `forced` and `force_reason` as evidence, but **the namespace
+supplies the structural demotion**. Editing `forced=false` in a forced
+generation's manifest changes nothing, because it is still in the forced
+directory and additionally breaks the envelope digest.
 
 ---
 
-## 10. `ValidatedDataset` strategy
+## 11. Acquisition evidence and observed coverage
 
-**Finding accepted: pandas DataFrames cannot be made immutable.** Verified:
-`@dataclass(frozen=True)` blocks only attribute reassignment; deep copy does not
-prevent mutation through the accessor; setting `arr.flags.writeable = False` on
-all six columns succeeded yet pandas 3.0 copy-on-write **still permitted the
-write**.
-
-Therefore the strategy is **tamper-evidence plus non-exposure**, not immutability:
-
-1. `ValidatedDataset.build(raw_or_frame, *, source, symbol, resolution,
-   acquisition, policies)` canonicalises, validates and computes the digest
-   **internally**. There is no parameter through which a report may be supplied,
-   so a mismatched report cannot exist. This removes defect 1 by construction.
-2. The instance holds a **private deep copy**; `.frame` is a property returning
-   a **fresh copy per call**. The internal frame is never handed out.
-3. Bound evidence is stored as **immutable snapshots** (frozen dataclasses,
-   tuples). Note: at baseline `ValidationReport`, `FetchReport` and
-   `DatasetManifest` are all plain mutable `@dataclass` — that must change.
-4. `__slots__`, frozen semantics, and `__reduce__` raising so the object cannot
-   be pickled and revived carrying stale authority.
-5. **Digest recomputed immediately before persistence** and compared to the
-   bound digest; divergence aborts the write.
-6. **Digest recomputed again at trusted read.**
-
-Mutation between `build()` and `write()` is *detected*, not *prevented*. That is
-the strongest guarantee available in this language, and the design says so
-rather than implying otherwise.
-
----
-
-## 11. Acquisition evidence model
-
-`failed_chunks == []` is not completeness. A successful call may return zero
-rows, truncated rows, only part of the period, the wrong range, or a sparse
-range.
-
-Six independent concepts, never collapsed into one boolean:
+`failed_chunks == []` is not completeness. Six concepts stay separate:
 
 | Concept | Answered by | Provable today? |
 |---|---|---|
 | 1. request success/failure | chunk results | yes |
-| 2. observed edge coverage | requested vs observed first/last | yes |
-| 3. internal continuity | gap model (§13) | partially — see §13 |
-| 4. expected session coverage | trading calendar | **no** |
-| 5. bar density | trading calendar | **no** |
-| 6. identity correctness | digest identity (§8) | yes |
+| 2. observed coverage | §11.2 | yes, as **fact** |
+| 3. internal continuity | §13 | only with a calendar |
+| 4. expected session coverage | calendar | **no** |
+| 5. bar density | calendar | **no** |
+| 6. identity correctness | §8, with the §16 caveat | partially |
+
+### 11.1 Acquisition classification
 
 ```
-ACQUISITION_FAILED         every chunk errored
-ACQUISITION_EMPTY          all chunks succeeded, all returned zero rows
-ACQUISITION_PARTIAL        any chunk failed, OR edges outside tolerance
-ACQUISITION_EDGE_COMPLETE  no chunk failed, ≥1 row, both edges within tolerance
-ACQUISITION_UNKNOWN        no acquisition evidence (fixtures, manual frames)
+ACQUISITION_FAILED      every chunk errored
+ACQUISITION_EMPTY       all chunks succeeded, all returned zero rows
+ACQUISITION_PARTIAL     any chunk failed or returned an error state
+ACQUISITION_SUCCEEDED   every chunk returned without error, ≥1 row overall
+ACQUISITION_UNKNOWN     no acquisition evidence (fixtures, manual frames)
 ```
 
-`EDGE_COMPLETE` is named to be honest. It means **only**: every requested chunk
-returned without error, and observed first/last timestamps reach both requested
-edges within `coverage_tolerance`. It does **not** mean interior data is
-continuous, that every session is present, that density is correct, or that the
-instrument is the one requested. A six-month interior hole is `EDGE_COMPLETE`
-*and* fails continuity — which is why authority requires both.
+Renamed from `EDGE_COMPLETE`: this enum now describes **only whether the
+requests succeeded**, not coverage. Coverage is a separate record, because
+conflating them is exactly how "3 candles for a year" became authoritative.
 
-`coverage_tolerance` has **no default**; it must be configured deliberately.
+### 11.2 `ObservedCoverage` — facts only
 
-`EMPTY` and `FAILED` are separate states, resolving the baseline behaviour where
-both produced the identical message `'fetch returned zero rows; nothing to store'`.
+The previous revision compared requested edges to observed timestamps under a
+generic tolerance. That is not meaningful: a request is expressed in **calendar
+dates**, observations begin at an intraday market time, and a requested boundary
+may fall on a weekend, holiday, half-day, future date or market closure.
+Distance-to-midnight proves nothing without a calendar.
+
+Recorded as fact, never graded:
+
+- `earliest_observed_date`, `latest_observed_date`
+- `observations_on_requested_start_date` (bool)
+- `observations_on_requested_end_date` (bool)
+- `all_observations_within_requested_window` (bool)
+- `observed_span_days`, `requested_span_days`
+- `distinct_observed_dates`
+
+**Absence of observations on a requested boundary date is NOT called partial**
+— that date may simply not have been a trading day. Grading requires
+`CalendarCertifiedCoverage`, which is unavailable and is marked `NOT_CERTIFIED`.
+
+The "3 candles for a one-year request" case is therefore recorded honestly:
+`ACQUISITION_SUCCEEDED`, `distinct_observed_dates = 1`,
+`requested_span_days = 365`, `SessionCertification = NOT_CERTIFIED`. It can
+still be a `TrustedDataset` **as an artifact**, but no consumer requiring
+session certification may use it.
 
 ---
 
-## 12. History-depth probe redesign (manager finding §7)
+## 12. History-depth probing — corrected
 
-**Confirmed defect.** `probe_earliest_available()` binary-searches on
-"this narrow window contains data", which is **not monotonic**. Counterexamples:
-a probe window landing entirely on a weekend, a long holiday cluster, a broker
-outage, or a sparsely-quoted period returns empty while both earlier and later
-periods contain data. Binary search then discards a region that does contain
-data. A previous audit could not *demonstrate* a failure and reported it as
-unconfirmed; that was too weak a conclusion — **correctness was never
-established, and absence of a demonstrated failure is not evidence of
-correctness.**
+**Two rejected algorithms, with counterexamples.**
 
-**Replacement:** exponential backward scan on a *monotonic* predicate, then
-local refinement.
+*Baseline binary search* on "this narrow window contains data" assumes
+monotonicity. A window landing on a weekend, holiday cluster, broker outage or
+sparsely-quoted period returns empty while both earlier and later periods
+contain data; the search then discards a region that does contain data.
 
-- Monotonic predicate: `any_data_in(candidate, known_good_newest)` — "does any
-  data exist anywhere between the candidate and a date already known to have
-  data". This is monotonic in the candidate because widening the window can only
-  add data, never remove it.
-- Phase 1: from a known-good recent anchor, probe backwards at exponentially
-  increasing offsets until the predicate turns false.
-- Phase 2: binary-search *within* the last bracketing interval, still using the
-  monotonic predicate.
-- Result reported as a **bracket** `[earliest_confirmed, earliest_possible]`,
-  never a single date implying more precision than was established.
+*The previous revision's proposed fix* — `any_data_in(candidate, known_good_newest)`
+— is **mathematically broken**, as the manager identified. If
+`known_good_newest` contains data, then every interval
+`[candidate, known_good_newest]` contains that same observation, so the
+predicate is constant-`TRUE` for all candidates and never produces the
+false/true bracket a search requires. It degenerates immediately.
 
-This costs more requests than the baseline; correctness outranks convenience.
-**Must not be run against the live broker until implemented and tested.**
+**What is being estimated.** These are not interchangeable, and the previous
+revision blurred them:
+
+- **(A)** earliest individual candle observed
+- **(B)** earliest calendar date with any candle
+- **(C)** earliest continuous-history boundary
+- **(D)** broker retention boundary
+
+We can establish **(A)** and **(B)** by observation. **(C)** requires a
+calendar. **(D)** cannot be proven at all — absence of response is not proof of
+absence of history.
+
+**Algorithm: bounded backward window scan, then subdivide.**
+
+1. Start from a recent known-good anchor.
+2. Walk backwards in **non-overlapping coarse windows** (configured, e.g. 90 days).
+3. Classify each window: `DATA`, `EMPTY_SUCCESS`, `ERROR`, `UNKNOWN`.
+4. **`ERROR` is never evidence of absence** — it is recorded as unresolved and
+   the scan continues.
+5. Continue until a user-configured **search horizon** (no unbounded scanning).
+6. Subdivide **only the oldest `DATA` window**, recursively, to the configured
+   temporal resolution.
+7. Report a **bracket plus evidence**, never a single retention date:
+   - `earliest_observed_candle` (A)
+   - `earliest_observed_date` (B)
+   - `oldest_contiguous_empty_success_interval`
+   - `unresolved_intervals` (errors/unknowns)
+   - `search_horizon`
+
+**Correctness argument.** The algorithm never concludes "no data before X" from
+any single empty window; it only reports what it observed and what it could not
+resolve. It makes no monotonicity assumption. Its output is an interval estimate
+whose width is bounded by the configured resolution, and unresolved regions are
+surfaced rather than silently treated as empty. Cost is O(horizon / window) plus
+O(log) refinement of one window — more requests than binary search, which is
+accepted: correctness outranks request count, subject to the §21 rate-limit note.
+
+**No live probing until this is implemented and tested.**
 
 ---
 
-## 13. Continuity, calendar and gap model (manager finding §12)
+## 13. Continuity, calendar and gap model
 
-`ABSURD_GAP_DAYS = 30` is **removed**. No principled basis for the value exists,
-and an unjustified constant must not gate research data. No `TradingCalendar`
-implementation exists anywhere in the repository — verified.
+`ABSURD_GAP_DAYS = 30` is removed. Correcting the previous revision: moving the
+number into configuration did **not** solve the knowledge problem, it only
+relocated the arbitrariness. No `TradingCalendar` exists in the repository —
+verified.
 
-Three separate concepts, per the directive:
+Three separate concepts:
 
 - **`ObservedGap`** — elapsed time between consecutive observations. Always
-  computable. Pure fact.
+  computable. Pure fact, carries no severity.
 - **`CalendarExplanation`** — whether a configured calendar explains the gap.
-  Requires a calendar; otherwise `UNKNOWN`.
-- **`GapPolicy`** — configuration deciding whether the available evidence
-  suffices for a given consumer. No magic numbers in code.
+  Without a calendar: `UNKNOWN` for every gap, uniformly.
+- **`GapPolicy`** — a *consumer's* declared requirement, not a property of the
+  artifact.
 
-`TradingCalendar` is a protocol only:
+`TradingCalendar` is a protocol only — `is_session_day(date)`,
+`expected_next_bar(ts, resolution)`, plus `calendar_id` and `calendar_version`
+which enter provenance when a real calendar arrives. **No NSE holiday or session
+data is invented in this phase.** Only `NullCalendar` ships, answering `UNKNOWN`
+to everything.
 
-```
-is_session_day(date) -> bool
-expected_next_bar(ts, resolution) -> Timestamp
-calendar_id / calendar_version        # provenanced when a real one arrives
-```
+**Certification, not gating:**
 
-**No NSE holiday or session data is invented in this phase.** Only
-`NullCalendar` ships, and it answers `UNKNOWN` to everything.
+| Situation | `ContinuityCertification` |
+|---|---|
+| No calendar configured | `NOT_CERTIFIED` — uniformly, for every gap size |
+| Calendar configured, all gaps explained | `CERTIFIED` |
+| Calendar configured, unexplained gap found | `FAILED` |
 
-Without a calendar the validator does not classify — it declines to certify,
-emitting `CONTINUITY_NOT_CERTIFIED` plus the measured gap span. Any gap above
-the configured `GapPolicy` threshold additionally emits `UNEXPLAINED_GAP`, which
-blocks `TrustedDataset` construction. Uncertainty is represented as uncertainty,
-never converted into an arbitrary number.
+`NOT_CERTIFIED` is **not** a failure — it is an honest statement that the
+question cannot be answered. A `TrustedDataset` may carry
+`ContinuityCertification = NOT_CERTIFIED`; whether that is acceptable is the
+consumer's decision, declared through its own `GapPolicy`. No calendar-day
+number decides whether the storage artifact is trusted.
 
-**A dataset may be a `TrustedDataset` without a calendar**, but only when no gap
-exceeds the configured threshold — and the threshold has no default.
+This cleanly separates **trusted artifact** from **complete market history**
+from **session-certified research input**.
 
 ---
 
-## 14. `TrustedDataset` construction rules
+## 14. Canonicalisation contract and anomaly severity
 
-Constructible **iff every check passes**. Each failure has a distinct exception
-type so callers cannot conflate them.
+**Confirmed defect.** `normalise()` sorts before the validator runs, so
+`TS_NOT_SORTED` can never fire on the production path — the source defect is
+silently repaired.
+
+**Invariant:** canonicalisation may produce a deterministic representation, but
+it may never erase evidence that the source delivered anomalous structure.
+
+```
+canonicalise(raw) -> CanonicalisationResult(frame, transformations, source_anomalies)
+```
+
+Recorded: source row count, source column inventory, source ordering
+(inversion count), duplicate timestamps at source, extra columns seen, timezone
+conversion applied, dtype conversions, rows reordered, rows removed, values
+changed, columns preserved or discarded.
+
+**Severity — provenance with enforcement, not a diary:**
+
+| Anomaly | Class | Reasoning |
+|---|---|---|
+| Timezone conversion preserving the instant | NORMAL TRANSFORMATION | No information changes |
+| Column reordering to canonical order | NORMAL TRANSFORMATION | Representation only |
+| Lossless dtype conversion | NORMAL TRANSFORMATION | Values preserved exactly |
+| Stable sort of an unsorted source | **INFO, recorded** | Valid canonicalisation, but the source got it wrong and that is provenance |
+| Exact duplicate rows at source | **WARNING** | Redundant but not contradictory |
+| Source extra column, known and mapped | INFO | Preserved per §15 |
+| **Conflicting duplicate timestamps** | **TRUST BLOCKER** | Two contradictory observations of one minute; choosing between them would discard evidence |
+| **Unsupported / unmapped source field** | **TRUST BLOCKER** | §15 |
+| **Row removal during canonicalisation** | **TRUST BLOCKER** | Never a normal transformation; only explicit cleaning may remove rows, and never on the trusted path |
+| Values changed | **TRUST BLOCKER** | Canonicalisation must never change a value |
+
+TRUST BLOCKER means `ValidatedDataset.build()` fails; nothing reaches storage.
+
+---
+
+## 15. Schema evolution and the positional payload
+
+**Confirmed defect.** `frame.loc[:, OHLCV_COLUMNS]` silently discards extra
+columns, contradicting the README.
+
+The previous revision proposed preserving unknown extras as `x_*`. **Withdrawn**
+— it contradicts the actual parser. `from_fyers_candles()` accepts exactly six
+*positional* fields. A seventh positional value has no name and therefore no
+meaning; inventing `x_unknown_7` would fabricate a research field out of an
+unknown number.
+
+**Policy by source shape:**
+
+| Source shape | Policy |
+|---|---|
+| Positional payload (FYERS `/history`) | Exactly the six known fields. **Any other width → reject ingestion** until the source contract is verified. No named preservation is possible. |
+| Named fields via an explicit source-schema mapping | Fields declared in the mapping (e.g. `oi`, `vwap`) are **preserved**, enter dataset identity, and are recorded in the column inventory |
+| Named field absent from the mapping | **Canonicalisation failure** on the trusted path |
+| Field with an unsupported dtype | **Canonicalisation failure** on the trusted path |
+
+Accepting the manager's preference for §10 of the directive: on the trusted path
+an unsupported field is a **failure**, not a recorded discard. Recorded discard
+was audit-friendly but still destructive, and discarded source information can
+change research meaning — a discarded `oi` column could be exactly what
+distinguishes two otherwise identical datasets. DATA INTEGRITY > CONVENIENCE.
+
+The forensic path (`read_unverified`, explicit import tooling) may preserve raw
+values or drop them with a record; it makes no trust claim either way.
+
+`schema_version` is recorded and is part of identity.
+
+---
+
+## 16. What identity does and does not prove
+
+FYERS history rows carry no symbol; each row is `[epoch, o, h, l, c, v]`.
+Therefore a successful response does **not** independently prove the broker
+returned candles for the requested instrument.
+
+Identity truthfully means:
+
+> *candles returned by this provider in response to a request for symbol X*
+
+and **not**:
+
+> *proven observations of instrument X*
+
+The requested symbol, provider, request parameters and response evidence all
+enter acquisition provenance so the claim is at least auditable. Cross-instrument
+verification would require an independent source and is out of scope for Phase 1.
+
+---
+
+## 17. `ValidatedDataset` strategy
+
+**pandas DataFrames cannot be made immutable** — verified: frozen dataclasses
+block only attribute reassignment; deep copy does not stop mutation through the
+accessor; setting `arr.flags.writeable = False` on all six columns succeeded yet
+pandas 3.0 copy-on-write **still permitted the write**.
+
+Strategy is therefore **tamper-evidence plus non-exposure**:
+
+1. `ValidatedDataset.build(...)` canonicalises, validates and computes digests
+   **internally**. No parameter accepts a report, so a mismatched report cannot
+   exist — defect 1 removed by construction.
+2. A **private deep copy** is held; `.frame` returns a **fresh copy per call**.
+3. Evidence is stored as **immutable snapshots**. Note: at baseline
+   `ValidationReport`, `FetchReport` and `DatasetManifest` are all mutable
+   `@dataclass` — that must change.
+4. `__slots__`, frozen semantics, `__reduce__` raising so it cannot be pickled
+   and revived carrying stale authority.
+5. **Digest recomputed immediately before persistence**; divergence aborts.
+6. **Digest recomputed again at trusted read.**
+
+Mutation between build and write is *detected*, not *prevented*. That is the
+strongest available guarantee in this language, stated rather than implied.
+
+---
+
+## 18. `TrustedDataset` construction rules
+
+Constructible **iff every check passes**. Each failure has a distinct exception.
 
 | # | Check | Failure |
 |---|---|---|
-| 1 | Generation selected by `CURRENT` exists and is complete | `DatasetNotFound` |
-| 2 | Manifest present | `MissingProvenance` |
-| 3 | Manifest parses; `schema_version` known; no unknown or missing fields | `ProvenanceSchemaError` |
-| 4 | Frame loads and is canonical | `SchemaError` |
-| 5 | **Digest recomputed** from loaded data == manifest digest | `IntegrityError` |
-| 6 | Manifest identity (source, symbol, resolution, schema) == digest inputs | `IdentityMismatch` |
-| 7 | **Validation re-run** on the loaded frame has no ERROR issues | `ValidationFailed` |
-| 8 | Acquisition classification is `EDGE_COMPLETE` | `IncompleteAcquisition` |
-| 9 | Continuity satisfies the active `GapPolicy` | `ContinuityNotCertified` |
-| 10 | Generation is not forced | `ForcedGeneration` |
-| 11 | Recorded acquisition evidence is internally consistent | `ProvenanceInconsistent` |
+| 1 | `CURRENT` names a complete generation in `trusted_generations/` | `DatasetNotFound` |
+| 2 | Manifest present and parseable; `schema_version` known; no unknown or missing fields | `ProvenanceSchemaError` |
+| 3 | Frame loads and is canonical | `SchemaError` |
+| 4 | `data_digest` recomputed == envelope value | `IntegrityError` |
+| 5 | `provenance_digest` recomputed == envelope value | `ProvenanceTampered` |
+| 6 | `integrity_id` recomputed == value recorded in `CURRENT` | `GenerationIntegrityError` |
+| 7 | Caller locator == envelope identity == digest identity inputs | `IdentityMismatch` |
+| 8 | Validation re-run on loaded frame has no ERROR issues | `ValidationFailed` |
+| 9 | Acquisition classification ∈ {`SUCCEEDED`} and evidence internally consistent | `AcquisitionEvidenceInvalid` |
+| 10 | Generation resides in the trusted namespace | *(structural — a forced generation is unreachable, not rejected)* |
 
-Scenario answers: valid Parquet + missing manifest → refuse (2). Valid manifest
-+ tampered Parquet → refuse (5). Unknown or missing manifest fields → refuse
-(3), never ignored. Contradictory fields → refuse (6/11). Validation passes but
-acquisition incomplete → refuse (8). A faithfully copied dataset → **passes**,
-correctly: a faithful copy *is* the same dataset.
+Continuity, session and reproducibility certifications are **attached, not
+gated** — the consumer decides.
 
 `read_unverified()` returns `UnverifiedDataset`, a distinct type with no
-authority attribute at all, so it cannot be substituted for a `TrustedDataset`
-even by accident.
+certification attributes, so it cannot be substituted even by accident.
 
 ---
 
-## 15. Manifest trust model
+## 19. Generation persistence, atomicity and durability
 
-| Class | Fields | Reader behaviour |
-|---|---|---|
-| Derived, re-verified | `content_digest`, `schema_version`, `source`, `symbol`, `resolution` | Recomputed; mismatch → reject |
-| Ignored for gating | `validation_status`, error/warning counts, error codes | Informational; validation is re-run |
-| Source evidence | acquisition snapshot, ingestion/canonicalisation snapshot | Checked for internal consistency; inconsistency → reject |
-| Operator declaration | `forced`, `force_reason`, `notes` | One-way only (below) |
-| Environment | software versions, git revision, `fetched_at_utc` | Never gating for validity; see §22 |
-| **Removed** | `is_authoritative` | Not stored, therefore not editable |
+**Generation id** is a **ULID** (128-bit, content-independent). The previous
+`g_<digest12>_<utc>` scheme is withdrawn: two writes can share a timestamp
+resolution and digest prefixes can collide. The full identity digest lives in the
+envelope, never as the sole filesystem uniqueness mechanism.
 
-**`forced`, precisely.** `false → true` **demotes** and is honoured. `true →
-false` **cannot promote**, because authority additionally requires re-run
-validation, re-derived acquisition status and continuity to pass; a generation
-was forced precisely because one of those fails. If a forced generation would
-independently pass every check, it is authoritative on its own merits and the
-flag was redundant. Recorded provenance may only reduce trust.
+**`CURRENT` is an ordinary UTF-8 pointer file** (not a symlink) — atomically
+replaceable and portable. It contains `generation_id` and `integrity_id`.
 
----
+**Write sequence.** Create generation directory → write `data.parquet` → flush →
+`fsync` file → write `manifest.json` → flush → `fsync` file → **`fsync` the
+generation directory** → **`fsync` the `generations` parent** → write
+`CURRENT.tmp` in the same parent → flush → `fsync CURRENT.tmp` →
+`os.replace(CURRENT.tmp, CURRENT)` → **`fsync` the dataset parent directory**.
 
-## 16. Generation-based atomic persistence
+**Correct crash guarantee** — correcting the previous revision, which claimed
+`CURRENT` still names the *previous* generation:
 
-```
-data_store/<source>/<symbol>/<resolution>/
-    generations/
-        g_<digest12>_<utc>/
-            data.parquet
-            manifest.json
-    CURRENT
-```
-
-A dataset generation is written as a unit. Sequence: create a fresh generation
-directory → write Parquet → `fsync` file → write manifest → `fsync` file →
-`fsync` generation directory → atomically `os.replace` the `CURRENT` pointer.
+> After a crash at any point, `CURRENT` names **either the previous complete
+> generation or the newly completed generation**. It never names an incomplete
+> generation.
 
 | Failure point | Outcome |
 |---|---|
-| generation dir creation | nothing changed |
-| Parquet write / fsync | orphan generation; `CURRENT` untouched |
-| manifest write / fsync | orphan generation; `CURRENT` untouched |
-| directory fsync | orphan generation; `CURRENT` untouched |
-| `CURRENT` replace | atomic; either old or new, never partial |
-| process death at any boundary | `CURRENT` still names the previous complete generation |
+| directory creation | nothing changed |
+| Parquet write / fsync | orphan generation; `CURRENT` unchanged |
+| manifest write / fsync | orphan generation; `CURRENT` unchanged |
+| generation/parent dir fsync | orphan generation; `CURRENT` unchanged |
+| `CURRENT.tmp` write/fsync | orphan generation; `CURRENT` unchanged |
+| `os.replace` | atomic — old or new, never partial |
+| after replace, before parent fsync | either value may survive; **both are complete generations** |
 
-**Invariant: a failed write can never destroy or replace the last trusted
-generation.** Orphan generations are inert — never selected by normal read,
-detectable by absence of a `CURRENT` reference, and safe to garbage-collect.
-This also resolves the baseline orphan-Parquet defect, since orphans are
-structural rather than accidental.
-
-`CURRENT` semantics: names exactly one generation directory; is updated only
-after that generation is complete and fsynced; is never advanced by a forced
-write when an authoritative generation already exists.
+**Platform assumptions, stated:** `os.replace` is atomic on POSIX and on Windows
+for same-volume replacement; directory `fsync` is meaningful on Linux/macOS and a
+no-op on some filesystems. Development and CI target macOS/Linux. Orphan
+generations are inert, never selected, detectable by absence from `CURRENT`, and
+safe to garbage-collect.
 
 ---
 
-## 17. Forced-generation semantics
+## 20. Reproducibility certification
 
-- `force=True` requires a non-empty `force_reason`, recorded in provenance. An
-  operator cannot force accidentally or anonymously.
-- A forced write creates a **separate generation** and does **not** advance
-  `CURRENT` when an authoritative generation exists.
-- Forced generations are **never** returned by `read_trusted()` — they fail
-  check 10 and, independently, 7, 8 or 9.
-- Reachable only through the explicit forensic API with an explicit generation
-  id.
-- **Force cannot be edited into authority**, because authority is re-derived and
-  never read from the flag. "Permanently marked" is not offered as a security
-  guarantee, since the mark is editable JSON — the guarantee comes from
-  derivation.
+`git_revision()` can return `unknown`, `not-a-git-repo` or `<sha>-dirty`, and
+baseline still treats the dataset as authoritative. **Data validity and
+reproducibility are different guarantees.**
 
-Force may write invalid, incomplete or unknown-acquisition data. It is an escape
-hatch for forensics, not a second definition of correctness.
+The previous revision's "environment matching the lock" was underspecified.
+Replacement: record an **`environment_spec_digest`** over a canonical
+environment description containing Python major.minor.patch, OS, architecture,
+direct dependency name/version pairs, full transitive dependency name/version
+pairs, lock file digest, git commit SHA, and git dirty flag.
+
+`ReproducibilityCertification = CERTIFIED` requires: git SHA known, tree clean,
+and `environment_spec_digest` recorded. It is `NOT_CERTIFIED` otherwise.
+
+**A different platform may produce logically identical data.** Reproducible
+*environment* and identical *dataset* are separate claims; the digest certifies
+the former, and the data digest independently establishes the latter.
 
 ---
 
-## 18. Secret lifecycle
+## 21. Secret lifecycle
 
-Baseline reads only the **current** environment value, so a rotated-out token
-becomes unredactable — verified.
+Baseline reads only the current environment value, so a rotated-out token becomes
+unredactable — verified.
 
-**Design: an append-only, process-lifetime `SecretRegistry`.** Secrets are
-registered explicitly when loaded (settings load, token exchange) and **never
-removed**, so `TOKEN_A` stays redacted after rotation to `TOKEN_B`.
+**Append-only, process-lifetime `SecretRegistry`.** Secrets are registered
+explicitly when loaded (settings load, token exchange) and **never removed**, so
+`TOKEN_A` stays redacted after rotation to `TOKEN_B`.
 
-**No LRU eviction.** The directive is explicit and correct: silently evicting a
-secret reintroduces the defect. Memory is bounded in practice by the number of
-credentials a process loads (single digits); if that ever changes, it will be
-measured before any eviction policy is considered.
+**No LRU eviction.** The previous revision proposed a bounded registry with
+eviction; that reintroduces the exact defect being fixed. Memory is bounded in
+practice by the number of credentials a process loads (single digits). If that
+ever changes, it will be **measured** before any eviction policy is considered.
 
-Registered: client secret, access token, auth code, any future refresh token,
-and any other credential material loaded by settings or authentication.
+Registered: client secret, access token, auth code, any future refresh token, and
+any other credential material loaded by settings or authentication.
 
-Redacted across: `record.msg`, `record.args`, exception messages, formatted
+Redacted across `record.msg`, `record.args`, exception messages, formatted
 tracebacks, chained and nested tracebacks, URLs, and multiline values. Redaction
 lives in the **formatter**, because filters run before `exc_info` is rendered.
 
-**Boundary stated honestly: FYERS SDK-owned logging is OUTSIDE our formatter.**
-The SDK constructs its own `FileHandler` and logs full URLs at debug level.
-Mitigation is to keep it at `ERROR`, point `log_path` into gitignored `logs/`,
-and document the boundary. We do **not** claim SDK logs are protected.
+**FYERS SDK-owned logging is OUTSIDE our formatter boundary.** The SDK builds its
+own `FileHandler` and logs full URLs at debug level. Mitigation: keep it at
+`ERROR`, point `log_path` into gitignored `logs/`, document the boundary. We do
+**not** claim SDK logs are protected.
 
-Short secrets (< 8 characters) remain unredacted by policy; real tokens are long
-and a lower threshold would redact ordinary words.
+Secrets shorter than 8 characters remain unredacted by policy; real tokens are
+long, and a lower threshold would redact ordinary words.
 
 ---
 
-## 19. External broker-error sanitisation (manager finding §15)
+## 22. Broker error sanitisation
 
 **Confirmed defect.** `historical.py` builds `detail` from the raw broker
-`message` and embeds it in exception text; four scripts then `print(f"…{exc}")`
-to stdout. Our redaction covers the logging path, **not** `print`. Broker-
-controlled text therefore reaches stdout unsanitised.
+`message` and embeds it in exception text; four scripts then `print(f"…{exc}")`.
+Our redaction covers logging, **not** `print`.
 
-Broker responses are **untrusted input**. They could echo request URLs, client
+Broker responses are **untrusted input** and could echo request URLs, client
 identifiers, auth codes or tokens.
 
-Design: a `BrokerDiagnostic` value carrying a numeric status/code, a **sanitised**
-message (length-capped, control characters stripped, passed through the secret
-registry), and redacted structured fields. Exceptions carry the diagnostic, not
-raw payload text. CLI output prints the diagnostic; raw payloads go only to the
-redacting logger at debug level. Useful broker errors are not hidden — they are
-not trusted verbatim.
+A `BrokerDiagnostic` value carries a numeric status/code, a **sanitised** message
+(length-capped, control characters stripped, passed through the secret registry)
+and redacted structured fields. Exceptions carry the diagnostic, not raw payload
+text. CLI prints the diagnostic; raw payloads reach only the redacting logger at
+debug level. Useful broker errors are not hidden — they are not trusted verbatim.
 
 ---
 
-## 20. Configuration validation (manager finding §20)
+## 23. Configuration validation
 
 **Confirmed defect.** `lot_size=int(lot_size) if lot_size else 1` silently turns
 `0` and `""` into `1`.
 
-Policy: **missing and invalid are different, and neither is repaired.**
+The previous revision's blanket "missing optional → `None`, never a default" was
+too broad; some fields legitimately have documented defaults. **What is forbidden
+is truthiness-based repair.**
 
-- Missing optional field → explicit `None`, never a substituted default.
-- Present but invalid (`0`, negative, wrong type, malformed numeric) → raise
-  naming the field, the value and the file.
-- Unknown keys → rejected, not ignored (they usually mean a typo).
-- Duplicate symbols → rejected.
-- Config carries a `schema_version`.
+Per-field schema declares one of: `required`; `optional nullable`; or
+`optional with an explicit documented default`.
 
----
+| Field | Class |
+|---|---|
+| `symbol`, `kind`, `role`, `exchange` | required |
+| `lot_size` | required positive integer **for a verified tradable instrument**; nullable while a candidate is unverified |
+| `tick_size` | optional nullable while unverified |
+| `verified` | optional, documented default `false` |
 
-## 21. Reproducibility certification (manager finding §18)
-
-`git_revision()` can return `unknown`, `not-a-git-repo` or `<sha>-dirty`, and the
-dataset could still be treated as authoritative. **Data validity and
-reproducibility are different guarantees and must not share one boolean.**
-
-Two independent attributes on `TrustedDataset`:
-
-- **`is_valid_market_data`** — §14 checks 1–11. Concerns the data.
-- **`is_reproducible`** — git revision known and clean, package versions
-  recorded, environment matching the lock. Concerns the *provenance of the code*
-  that produced it.
-
-A dataset may be trustworthy market data while not being a reproducible research
-artifact (produced from a dirty tree, say). Phase 2 must be able to require
-either or both. Collapsing them would either block legitimate work or silently
-certify irreproducible results.
-
----
-
-## 22. Dependency and environment strategy
-
-Current clean install requires installing dependencies and then **manually
-uninstalling `asyncio`** — fragile, and a forgotten step leaves a package that
-shadows the standard library. `requirements.lock.txt` is a flat pinned snapshot
-without hashes or platform markers.
-
-No dependency changes in this design step. Target invariant:
-
-> fresh environment → one documented install workflow → correct Python 3.12
-> environment → no manual repair step → full tests pass
-
-Candidates to evaluate later: `pyproject.toml` with a proper lock (`uv.lock`), a
-constraints/override mechanism to neutralise the `asyncio` declaration, or a
-verified wrapper install script that fails loudly if the environment is wrong.
-
----
-
-## 23. CI strategy
-
-The manager verified zero attached CI statuses at `e74d333`; `main` is
-unprotected with no required checks. **No CI is added in this design step.**
-
-Eventual pipeline: Python 3.12 setup → reproducible dependency install →
-`pytest -W error` → `compileall` → source scans for prohibited operations and
-order-placement calls → repository secret scan.
-
-**CI success is not a substitute for manager review.** Until branch protection
-exists, the gate is enforced by workflow: development on
-`phase1-trust-hardening`, never pushed directly to `main`.
+Present-but-invalid (`0`, negative, wrong type, malformed numeric) raises naming
+the field, value and file. Unknown keys rejected. Duplicate symbols rejected.
+Config carries a `schema_version`.
 
 ---
 
@@ -614,140 +714,152 @@ One end-to-end integration test whose sole purpose is:
 > Nothing invalid, incomplete, forged, stale, forced or tampered can be converted
 > into a `TrustedDataset`.
 
-Each of the following must fail to produce a `TrustedDataset`:
+Each must fail: invalid frame · validation from a different frame · frame mutated
+after validation · source-order anomaly · **manifest `requested_range` shortened
+to match sparse data** · **manifest chunk failures removed** · forged
+`validation_status` · forged acquisition status · forged `forced` flag · forged
+data digest · **provenance envelope modified without updating the pointer
+digest** · **pointer `integrity_id` modified** · copied manifest from another
+dataset · modified Parquet · missing manifest · partial acquisition · all chunks
+empty · all chunks failed · huge interior gap where a policy requires continuity
+· duplicate conflicting candles · unsupported schema field · **extra positional
+broker field** · **ambiguous string containing encoding delimiters** · **valid
+dataset written through the force path** · **forced manifest edited to
+`force=false`** · interrupted generation write · **`CURRENT` crash recovery,
+old-complete and new-complete cases** · **generation id collision attempt** ·
+**wrong expected source / symbol / resolution locator**.
 
-invalid frame · validation from a different frame · frame mutated after
-validation · source-order anomaly · forged `validation_status` · forged
-acquisition status · forged `forced` flag · forged content digest · copied
-manifest from another dataset · edited manifest · modified Parquet · missing
-manifest · partial acquisition · all chunks empty · all chunks failed ·
-edge-only sparse acquisition · huge interior gap · duplicate conflicting candles
-· unsupported schema fields · forced generation · interrupted generation write ·
-stale `CURRENT` pointer · wrong symbol · wrong resolution · wrong source.
-
-A dataset genuinely satisfying every invariant must still succeed — the test
-must prove the gate is not simply refusing everything.
+A dataset genuinely satisfying every invariant must still succeed — the test must
+prove the gate is not simply refusing everything.
 
 ---
 
 ## 25. Test matrix
 
+Correcting the previous revision: numeric expectations like "29-day hole blocks"
+are **removed**. They encoded a magic number as semantics. Tests are
+policy-based.
+
 | Invariant | Unit | Integration | Adversarial | Mutation |
 |---|---|---|---|---|
-| Ingestion evidence | anomaly recorded | out-of-order FYERS response | source order erased | remove recording |
-| Schema policy | extra column preserved | round-trip with `x_oi` | unsupported dtype | silent drop |
-| Identity/digest | §9 matrix | write→read stable | 1e-9, ±0.0, NaN, inf, NA/0 | revert to `%.10g` |
-| Binding | build rejects a report arg | download→write path | all 10 mismatch cases | remove binding |
+| Canonical encoding | type-tag matrix | write→read stable | delimiter-bearing strings, Unicode NFC, 1e-9, ±0.0, NaN, inf, NA/0 | revert to `%.10g` |
+| Ingestion evidence | anomaly recorded | out-of-order response | source order erased | remove recording |
+| Anomaly severity | each class | blocker halts build | conflicting duplicates | downgrade a blocker |
+| Schema policy | mapped field preserved | round-trip with `oi` | 7-field positional payload | allow unknown field |
+| Binding | build rejects a report arg | download→write | all mismatch cases | remove binding |
 | Tamper-evidence | mutate after build | build→mutate→write | mutate via accessor | remove recompute |
-| Acquisition | 5 states | all/none/some chunks fail | empty vs failed | `failed==0` shortcut |
-| Probe | monotonic predicate | bracket result | holiday/outage windows | restore binary search |
-| Continuity | 1/3/7/14/29/30/31/90/180 d | with and without calendar | 29-day hole blocks | remove threshold |
-| Trusted read | each of 11 checks | full pipeline | forge each field | delete a check |
-| Generation atomicity | each failure point | interrupted write | kill between stages | non-atomic rename |
-| Force | separate generation | force over authoritative | flip flag both ways | allow CURRENT advance |
-| Secrets | registry lifetime | rotation A→B | A in traceback after rotation | remove registry |
+| Envelope integrity | digest computation | manifest edit detected | edit each envelope field | skip envelope check |
+| Locator identity | three-way agreement | wrong symbol locator | manifest says SBIN | drop locator check |
+| Acquisition | 5 states | all/none/some fail | empty vs failed | `failed==0` shortcut |
+| ObservedCoverage | facts recorded | 1 day for 1-year request | boundary on a weekend | grade absence as partial |
+| Probe | window classification | bracket output | ERROR windows, holiday windows | restore binary search |
+| Continuity | NOT_CERTIFIED without calendar | fake deterministic calendar identifies a known missing session | policy threshold N: gap > N gives expected policy result | remove certification |
+| Trusted read | each of 9 checks | full pipeline | forge each field | delete a check |
+| Generation atomicity | each failure point | crash between stages | old-complete and new-complete recovery | non-atomic rename |
+| Generation id | uniqueness | concurrent writes | collision attempt | content-derived id |
+| Force namespace | separate directory | force over trusted | edit `forced=false` | allow CURRENT to point at forced |
+| Secrets | registry lifetime | rotation A→B | A in traceback after rotation | add eviction |
 | Broker text | sanitiser | error → CLI | payload containing a token | echo raw |
-| Config | strict parse | load registry | `0`, `""`, unknown key | restore truthiness |
-| Reproducibility | dirty tree | — | unknown revision | merge the two booleans |
+| Config | per-field schema | load registry | `0`, `""`, unknown key | restore truthiness |
+| Reproducibility | dirty tree | env digest | platform difference | merge with validity |
 
 Every invariant must have at least one test that **fails when the production
-check is removed**. Mutation testing at baseline caught 9 of 9 attempted
-reversions; that standard carries forward.
+check is removed**. Baseline mutation testing caught 9 of 9 attempted reversions;
+that standard carries forward.
 
 ---
 
 ## 26. Failure-state matrix
 
+Corrected: the previous revision claimed consistent manifest tampering is caught
+by revalidation. **That is false** — a manifest can be altered in fields
+unrelated to OHLC validity (requested range, chunk failures, force reason,
+canonicalisation evidence) and stay self-consistent. Revalidation cannot see it;
+the **envelope digest** can.
+
 | State | `read_trusted()` | `read_unverified()` |
 |---|---|---|
-| No dataset | `DatasetNotFound` | `DatasetNotFound` |
-| Orphan generation only | `DatasetNotFound` | reachable by explicit id |
-| Manifest missing | `MissingProvenance` | returns data, no authority |
-| Manifest unparseable / unknown fields | `ProvenanceSchemaError` | returns data |
-| Parquet tampered | `IntegrityError` | returns data |
-| Manifest tampered consistently | `ValidationFailed` (re-run catches it) | returns data |
-| Identity mismatch | `IdentityMismatch` | returns data |
+| No dataset / orphan only | `DatasetNotFound` | orphan reachable by explicit id |
+| Manifest missing / unparseable / unknown fields | `ProvenanceSchemaError` | returns data |
+| Parquet tampered | `IntegrityError` (data digest) | returns data |
+| **Manifest tampered, self-consistent** | **`ProvenanceTampered` (envelope digest)** | returns data |
+| Manifest and Parquet tampered consistently | `GenerationIntegrityError` (pointer) | returns data |
+| Pointer edited | `GenerationIntegrityError` | n/a |
+| Locator disagrees with envelope | `IdentityMismatch` | n/a |
 | Validation errors | `ValidationFailed` | returns data |
-| Acquisition partial/empty/failed/unknown | `IncompleteAcquisition` | returns data |
-| Continuity uncertified | `ContinuityNotCertified` | returns data |
-| Forced generation | `ForcedGeneration` | reachable by explicit id |
-| Valid but irreproducible | **succeeds**, `is_reproducible=False` | n/a |
+| Acquisition partial/empty/failed/unknown | `AcquisitionEvidenceInvalid` | returns data |
+| Forced generation | **unreachable** (namespace) | reachable by explicit id |
+| Valid, continuity not certified | **succeeds**, `ContinuityCertification=NOT_CERTIFIED` | n/a |
+| Valid, irreproducible | **succeeds**, `ReproducibilityCertification=NOT_CERTIFIED` | n/a |
 | Fully valid | **succeeds** | n/a |
 
 ---
 
-## 27. Backward compatibility and migration
+## 27. Backward compatibility
 
 `data_store/` is **empty** at baseline — verified. The generation-directory
-layout is a breaking on-disk format change that is **free now and expensive
-later**. No migration path is required, and none will be written. This is the
-one decision with irreversible-ish consequences; it was raised with the manager
-before this document and the generation model was approved in principle.
-
-The manifest schema also changes incompatibly (`is_authoritative` removed,
-snapshots added). Same reasoning applies.
+layout and the manifest/envelope schema are breaking on-disk changes that are
+**free now and expensive later**. No migration path is required and none will be
+written.
 
 ---
 
 ## 28. Implementation sequence
 
-Reordered from the manager's suggested A–K where repository dependencies
-require it. Reasons for each deviation are given.
+CI moves to the front, accepting the manager's reasoning: automation should
+protect the review branch **during** this rewrite, not after it.
 
 | # | Unit | Addresses | Note |
 |---|---|---|---|
-| 1 | Schema policy + canonicalisation contract with evidence | 5, 6 | **Must precede the digest** — it determines what the digest covers |
-| 2 | Exact dataset identity + digest | 7, 8 | Depends on 1; also fixes the false docstring |
-| 3 | Immutable evidence snapshots | prerequisite | `ValidationReport`/`FetchReport` are mutable at baseline |
-| 4 | `ValidatedDataset` + write accepting only it | 1 | Depends on 2, 3 |
-| 5 | Generation storage + atomic `CURRENT` | 10, 11 | **Must precede the read boundary** — read selects a generation |
-| 6 | Acquisition outcome + evidence snapshot | 3, 17 | |
-| 7 | Probe redesign | 13 | Independent; must land before any live depth claim |
-| 8 | `TrustedDataset` read boundary | 2, 9 | Depends on 4, 5, 6 |
-| 9 | Gap/continuity policy + calendar protocol | 4 | |
-| 10 | `SecretRegistry` + broker diagnostics | 12, 14 | Independent of the data path |
-| 11 | Strict config validation | 16 | Independent |
-| 12 | `write_token_to_env` validation | 15 | Small, independent |
-| 13 | Dependency/CI hardening | — | |
-| 14 | Documentation reconciliation | — | Last, so it describes what exists |
+| 1 | **Minimal CI** on the review branch using the existing documented install (including the `asyncio` uninstall step) | — | Protects everything that follows; evolves once locking improves |
+| 2 | Schema policy + canonicalisation contract with evidence and severity | 5, 6 | **Must precede the digest** — determines what it covers |
+| 3 | Canonical encoding + dataset identity digest | 7, 8 | Depends on 2 |
+| 4 | Immutable evidence snapshots | prerequisite | Baseline reports are mutable |
+| 5 | `ValidatedDataset` + write accepting only it | 1 | Depends on 3, 4 |
+| 6 | Provenance envelope + generation integrity id | 2 | Depends on 3 |
+| 7 | Generation storage, namespaces, atomic `CURRENT` | 10, 11 | **Must precede the read boundary** |
+| 8 | Acquisition classification + `ObservedCoverage` | 3 | |
+| 9 | `TrustedDataset` read boundary | 9 | Depends on 5, 6, 7, 8 |
+| 10 | Probe redesign | 13 | Independent; gates any live depth claim |
+| 11 | Continuity/session certification + calendar protocol | 4 | |
+| 12 | `SecretRegistry` + broker diagnostics | 12, 14 | Independent of the data path |
+| 13 | Strict config validation | 16 | Independent |
+| 14 | `write_token_to_env` validation | 15 | Small, independent |
+| 15 | Dependency reproducibility (`pyproject`/lock/constraints) | — | CI upgraded alongside |
+| 16 | Documentation reconciliation | — | Last, so it describes what exists |
 
-Deviations from A–K: schema policy moves ahead of the digest (§7 coupling);
-generation storage moves ahead of the trusted read boundary; the probe redesign
-is separated because it is independent of the trust chain and gates live use.
-
-Each unit: test first → implementation → full suite → adversarial test → commit
-→ push review branch → **STOP** for manager inspection on GitHub.
+Each unit: test first → implementation → full suite → adversarial test → commit →
+push review branch → **STOP** for manager inspection on GitHub. **CI passing is
+not a substitute for manager review.**
 
 ---
 
-## 29. Open design risks
+## 29. Open risks
 
-1. **Tamper-evidence is weaker than immutability.** A mutation between build and
+1. **Tamper-evidence is weaker than immutability** — mutation between build and
    write is detected, not prevented. Unavoidable in pandas.
-2. **`/history` response shape is still ASSUMED.** The schema policy is designed
-   against an unverified contract; the extra-column namespace may need revision
-   after the first live call.
-3. **Without a calendar, density is never certified.** `TrustedDataset`
-   guarantees less than "the data is complete". Phase 2 must not read more into
-   it than §11 states.
-4. **SDK logs remain outside the redaction boundary** — permanently.
-5. **Digest cost is O(rows) in Python.** ~90k rows/year is fine; multi-year
-   should be measured.
-6. **Probe cost rises** under the corrected algorithm; correctness outranks
-   request count, but the budget interacts with rate limits.
-7. **No live verification of anything.** Every adapter behaviour remains
-   MOCK-VERIFIED.
+2. **The `/history` contract is ASSUMED**, never LIVE-VERIFIED. The positional
+   rejection rule in §15 is designed against an unverified contract.
+3. **Instrument correctness is unprovable** from candles alone (§16).
+4. **Continuity and session coverage are uncertifiable** without a calendar, and
+   no calendar exists.
+5. **SDK logs remain outside the redaction boundary**, permanently.
+6. **Probe cost rises** materially under §12 and interacts with rate limits;
+   window size and horizon must be tuned against the documented daily cap.
+7. **Digest cost is O(rows)** in Python; fine at ~90k rows/year, unmeasured beyond.
+8. **Out-of-scope actor** can recompute all digests and the pointer. Stated, not
+   defended against.
 
 ---
 
 ## 30. Non-goals
 
-Explicitly **not** in Phase 1: strategy logic, indicators, signal generation,
-backtesting, optimisation, walk-forward, Monte Carlo, TradingView or Pine
-integration, webhooks, dashboards, paper trading, order execution of any kind,
-live-trading mode, execution-instrument selection, NSE calendar data, and any
-performance or profitability claim.
+Not in Phase 1: strategy logic, indicators, signal generation, backtesting,
+optimisation, walk-forward, Monte Carlo, TradingView or Pine integration,
+webhooks, dashboards, paper trading, order execution, live-trading mode,
+execution-instrument selection, NSE calendar data, and any performance or
+profitability claim.
 
-Also not goals: defending against an attacker with machine access;
-cryptographic signing; making pandas immutable; certifying bar density without a
-calendar.
+Also not goals: defending against an attacker with machine access; asymmetric
+signing; making pandas immutable; certifying continuity, session coverage or bar
+density without a calendar; proving instrument identity from candle data.
