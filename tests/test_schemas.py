@@ -349,13 +349,22 @@ def test_source_evidence_reflects_source_representation_not_canonical_value():
 
     result = canonicalise(frame)
     assert len(result.frame) == 2, "both observations must survive"
-    assert "SOURCE_CONFLICTING_TIMESTAMPS" in anomaly_codes(result), (
-        "int(1) and '1' differ as received; source-level equality must not "
-        "silently merge them into a duplicate"
-    )
+
+    # int(1) and "1" are NOT equal as received -- this is not an exact
+    # source-level duplicate.
     assert "SOURCE_EXACT_DUPLICATE_ROWS" not in anomaly_codes(result)
-    # After canonical numeric conversion, both rows legitimately show 1.0 --
-    # that convergence is a fact about the CANONICAL frame, not the source.
+
+    # But the SOURCE did present two rows sharing one timestamp -- that
+    # structural fact is true regardless of how the values later resolve.
+    assert "SOURCE_DUPLICATE_TIMESTAMPS" in anomaly_codes(result)
+    assert result.source.duplicate_timestamp_row_count == 2
+
+    # Once losslessly converted, both canonical values agree (1.0 == 1.0),
+    # so there is NO market-value conflict. A representation difference that
+    # converges to the same canonical value must not be reported as a
+    # BLOCKER: doing so would treat ordinary lossless parsing as a data
+    # integrity failure.
+    assert "CANONICAL_CONFLICTING_TIMESTAMPS" not in anomaly_codes(result)
     assert result.frame[OPEN].tolist() == [1.0, 1.0]
 
 
@@ -393,20 +402,20 @@ def test_conflict_matrix_case_A_two_identical_is_duplicate_not_conflict():
     result = canonicalise(_rows_sharing_one_timestamp(100.0, 100.0))
     assert len(result.frame) == 2, "both rows must survive"
     assert "SOURCE_EXACT_DUPLICATE_ROWS" in anomaly_codes(result)
-    assert "SOURCE_CONFLICTING_TIMESTAMPS" not in anomaly_codes(result)
+    assert "CANONICAL_CONFLICTING_TIMESTAMPS" not in anomaly_codes(result)
 
 
 def test_conflict_matrix_case_B_two_distinct_is_conflict():
     result = canonicalise(_rows_sharing_one_timestamp(100.0, 200.0))
     assert len(result.frame) == 2
-    assert "SOURCE_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
-    assert anomaly(result, "SOURCE_CONFLICTING_TIMESTAMPS").severity is AnomalySeverity.BLOCKER
+    assert "CANONICAL_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
+    assert anomaly(result, "CANONICAL_CONFLICTING_TIMESTAMPS").severity is AnomalySeverity.BLOCKER
 
 
 def test_conflict_matrix_case_C_AAB_is_conflict():
     result = canonicalise(_rows_sharing_one_timestamp(100.0, 100.0, 200.0))
     assert len(result.frame) == 3
-    assert "SOURCE_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
+    assert "CANONICAL_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
 
 
 def test_conflict_matrix_case_D_AABB_is_conflict():
@@ -414,15 +423,15 @@ def test_conflict_matrix_case_D_AABB_is_conflict():
     observations (100.0 and 200.0) share the timestamp."""
     result = canonicalise(_rows_sharing_one_timestamp(100.0, 100.0, 200.0, 200.0))
     assert len(result.frame) == 4, "all four rows must survive"
-    assert "SOURCE_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
-    assert anomaly(result, "SOURCE_CONFLICTING_TIMESTAMPS").severity is AnomalySeverity.BLOCKER
+    assert "CANONICAL_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
+    assert anomaly(result, "CANONICAL_CONFLICTING_TIMESTAMPS").severity is AnomalySeverity.BLOCKER
 
 
 def test_conflict_matrix_case_E_four_identical_is_duplicate_not_conflict():
     result = canonicalise(_rows_sharing_one_timestamp(100.0, 100.0, 100.0, 100.0))
     assert len(result.frame) == 4
     assert "SOURCE_EXACT_DUPLICATE_ROWS" in anomaly_codes(result)
-    assert "SOURCE_CONFLICTING_TIMESTAMPS" not in anomaly_codes(result)
+    assert "CANONICAL_CONFLICTING_TIMESTAMPS" not in anomaly_codes(result)
 
 
 def test_conflict_matrix_case_F_conflict_in_one_of_two_timestamp_groups():
@@ -433,13 +442,13 @@ def test_conflict_matrix_case_F_conflict_in_one_of_two_timestamp_groups():
     combined = pd.concat([t1, t2], ignore_index=True)
     result = canonicalise(combined)
     assert len(result.frame) == 4
-    assert "SOURCE_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
+    assert "CANONICAL_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
 
 
 def test_no_duplicate_anomaly_on_clean_input():
     codes = anomaly_codes(canonicalise(make_ohlcv(10)))
     assert "SOURCE_EXACT_DUPLICATE_ROWS" not in codes
-    assert "SOURCE_CONFLICTING_TIMESTAMPS" not in codes
+    assert "CANONICAL_CONFLICTING_TIMESTAMPS" not in codes
 
 
 # --- value preservation ---------------------------------------------------
@@ -485,6 +494,115 @@ def test_integral_float_volume_is_accepted_losslessly():
     frame[VOLUME] = frame[VOLUME].astype("float64")
     result = canonicalise(frame)
     assert result.frame[VOLUME].tolist() == frame[VOLUME].astype("int64").tolist()
+
+
+# --- duplicate-timestamp structural evidence (distinct from exact-duplicate
+# rows and distinct from canonical conflict) -------------------------------
+
+
+def test_duplicate_timestamp_row_count_definition():
+    """Locks the definition: rows whose timestamp is shared, regardless of
+    whether the rest of the row matches. Both A,A and A,B produce the same
+    count for the same group size -- multiplicity of VALUE agreement is a
+    separate question from multiplicity of TIMESTAMP sharing."""
+    same_values = canonicalise(_rows_sharing_one_timestamp(100.0, 100.0))
+    different_values = canonicalise(_rows_sharing_one_timestamp(100.0, 200.0))
+    assert same_values.source.duplicate_timestamp_row_count == 2
+    assert different_values.source.duplicate_timestamp_row_count == 2
+
+
+def test_duplicate_timestamp_row_count_zero_when_all_timestamps_unique():
+    result = canonicalise(make_ohlcv(10))
+    assert result.source.duplicate_timestamp_row_count == 0
+    assert "SOURCE_DUPLICATE_TIMESTAMPS" not in anomaly_codes(result)
+
+
+def test_exact_duplicate_implies_duplicate_timestamp_but_not_reverse():
+    """A,A is both an exact duplicate AND a duplicate timestamp. A,B (distinct
+    values) is a duplicate timestamp WITHOUT being an exact duplicate."""
+    exact = canonicalise(_rows_sharing_one_timestamp(100.0, 100.0))
+    assert "SOURCE_EXACT_DUPLICATE_ROWS" in anomaly_codes(exact)
+    assert "SOURCE_DUPLICATE_TIMESTAMPS" in anomaly_codes(exact)
+
+    distinct = canonicalise(_rows_sharing_one_timestamp(100.0, 200.0))
+    assert "SOURCE_EXACT_DUPLICATE_ROWS" not in anomaly_codes(distinct)
+    assert "SOURCE_DUPLICATE_TIMESTAMPS" in anomaly_codes(distinct)
+
+
+# --- lossless dtype/representation conversion evidence (manager matrix) --
+#
+# Frozen architecture section 14: a lossless dtype conversion is a NORMAL
+# TRANSFORMATION, not a defect. It must be recorded when it actually happens,
+# and NOT recorded when the source already had the canonical dtype.
+
+
+def test_dtype_matrix_A_canonical_float64_price_records_nothing():
+    result = canonicalise(make_ohlcv(5))  # already float64 prices
+    codes = transformation_codes(result)
+    assert "DTYPE_CONVERTED_OPEN" not in codes
+    assert "DTYPE_CONVERTED_HIGH" not in codes
+    assert "DTYPE_CONVERTED_LOW" not in codes
+    assert "DTYPE_CONVERTED_CLOSE" not in codes
+
+
+def test_dtype_matrix_B_numeric_string_price_is_recorded():
+    frame = make_ohlcv(5)
+    frame[OPEN] = frame[OPEN].astype(object)
+    frame.loc[0, OPEN] = "24000.5"  # numeric string, still object dtype overall
+    result = canonicalise(frame)
+    assert "DTYPE_CONVERTED_OPEN" in transformation_codes(result)
+    assert result.frame[OPEN].iloc[0] == 24000.5
+
+
+def test_dtype_matrix_C_canonical_Int64_volume_records_nothing():
+    frame = make_ohlcv(5)
+    frame[VOLUME] = frame[VOLUME].astype("Int64")
+    result = canonicalise(frame)
+    assert "DTYPE_CONVERTED_VOLUME" not in transformation_codes(result)
+
+
+def test_dtype_matrix_D_integral_float64_volume_is_recorded():
+    frame = make_ohlcv(5)
+    frame[VOLUME] = frame[VOLUME].astype("float64")
+    result = canonicalise(frame)
+    assert "DTYPE_CONVERTED_VOLUME" in transformation_codes(result)
+    description = next(
+        t.description for t in result.transformations
+        if t.code == "DTYPE_CONVERTED_VOLUME"
+    )
+    assert "float64" in description and "Int64" in description
+
+
+def test_dtype_matrix_E_fractional_volume_raises_no_result():
+    """SchemaError, no partial CanonicalisationResult -- distinct from a
+    dtype TRANSFORMATION, which only ever describes a SUCCESSFUL conversion."""
+    frame = make_ohlcv(5)
+    frame[VOLUME] = frame[VOLUME].astype("float64")
+    frame.loc[1, VOLUME] = 250.7
+    with pytest.raises(SchemaError, match="whole number"):
+        canonicalise(frame)
+
+
+def test_dtype_matrix_F_malformed_numeric_string_raises_no_result():
+    frame = make_ohlcv(5)
+    frame[OPEN] = frame[OPEN].astype(object)
+    frame.loc[1, OPEN] = "not-a-number"
+    with pytest.raises(SchemaError, match="not parseable as numeric"):
+        canonicalise(frame)
+
+
+def test_dtype_conversion_is_not_described_as_a_value_change():
+    """Section 11: a lossless representation conversion must not be
+    describable as a semantic market-value modification."""
+    frame = make_ohlcv(5)
+    frame[VOLUME] = frame[VOLUME].astype("float64")
+    result = canonicalise(frame)
+    description = next(
+        t.description for t in result.transformations
+        if t.code == "DTYPE_CONVERTED_VOLUME"
+    )
+    assert "value change" not in description.lower() or "not a value change" in description.lower()
+    assert "representation" in description.lower()
 
 
 # --- defensive copy and immutability of evidence -------------------------
@@ -586,12 +704,82 @@ def test_fyers_empty_payload_has_no_epoch_transformation():
     assert transformation_codes(result) == set()
 
 
+def test_fyers_empty_payload_source_evidence_is_fully_honest():
+    """Section 13: for [], every fact must be the vacuous/absent case, not a
+    default that happens to look like 'nothing wrong'."""
+    result = canonicalise_fyers_candles([])
+    assert result.source.row_count == 0
+    assert result.source.timestamps_sorted is True
+    assert result.source.descending_adjacent_pairs == 0
+    assert result.source.exact_duplicate_row_count == 0
+    assert result.source.duplicate_timestamp_row_count == 0
+    assert anomaly_codes(result) == set()
+    assert transformation_codes(result) == set()
+
+
+# --- FYERS adapter-input evidence: measured on RAW epoch integers, BEFORE
+# epoch->Timestamp conversion (section 6/7) ---------------------------------
+
+
+def test_fyers_raw_epoch_order_is_measured_before_conversion():
+    """epoch3, epoch1, epoch2 (out of order) -> SOURCE_UNSORTED recorded,
+    canonical output ascending IST, all rows survive."""
+    base = candles_payload(3)["candles"]  # three ascending epochs
+    shuffled = [base[2], base[0], base[1]]  # epoch3, epoch1, epoch2
+    result = canonicalise_fyers_candles(shuffled)
+    assert result.source.row_count == 3
+    assert result.source.timestamps_sorted is False
+    assert "SOURCE_UNSORTED" in anomaly_codes(result)
+    assert result.frame[TS].is_monotonic_increasing
+    assert len(result.frame) == 3, "no observations may be removed"
+    # The canonical output's actual epoch order, once sorted, must match the
+    # original ascending sequence -- proving the sort used the RIGHT ordering
+    # key, not an artifact of shuffling.
+    assert result.frame[TS].tolist() == canonicalise_fyers_candles(base).frame[TS].tolist()
+
+
+def test_fyers_raw_epoch_order_matches_generic_canonicalise_inversion_count():
+    """The adapter-level inversion count must agree with what a direct
+    generic canonicalise() call would find on the equivalent IST-converted
+    frame -- proving the two measurement paths are consistent."""
+    base = candles_payload(4)["candles"]
+    shuffled = [base[1], base[3], base[0], base[2]]
+    result = canonicalise_fyers_candles(shuffled)
+    assert result.source.descending_adjacent_pairs > 0
+    # Same shuffle, measured generically on the already-converted frame.
+    import pandas as _pd
+
+    from core.timeutils import epoch_series_to_ist as _to_ist
+
+    frame = _pd.DataFrame(shuffled, columns=list(OHLCV_COLUMNS))
+    frame[TS] = _to_ist(frame[TS])
+    generic = canonicalise(frame)
+    assert result.source.descending_adjacent_pairs == generic.source.descending_adjacent_pairs
+
+
+def test_fyers_raw_duplicate_epoch_is_measured_before_conversion():
+    row = candles_payload(1)["candles"][0]
+    duplicate_epoch_different_close = list(row)
+    duplicate_epoch_different_close[4] = duplicate_epoch_different_close[4] + 10.0
+    result = canonicalise_fyers_candles([row, duplicate_epoch_different_close])
+    assert result.source.duplicate_timestamp_row_count == 2
+    assert "SOURCE_DUPLICATE_TIMESTAMPS" in anomaly_codes(result)
+    assert len(result.frame) == 2, "both observations must survive"
+
+
+def test_fyers_raw_exact_duplicate_row_is_measured_before_conversion():
+    row = candles_payload(1)["candles"][0]
+    result = canonicalise_fyers_candles([row, list(row)])
+    assert result.source.exact_duplicate_row_count == 1
+    assert "SOURCE_EXACT_DUPLICATE_ROWS" in anomaly_codes(result)
+
+
 def test_fyers_exact_duplicate_candle_is_a_duplicate_not_a_conflict():
     row = candles_payload(1)["candles"][0]
     result = canonicalise_fyers_candles([row, list(row)])
     assert len(result.frame) == 2
     assert "SOURCE_EXACT_DUPLICATE_ROWS" in anomaly_codes(result)
-    assert "SOURCE_CONFLICTING_TIMESTAMPS" not in anomaly_codes(result)
+    assert "CANONICAL_CONFLICTING_TIMESTAMPS" not in anomaly_codes(result)
 
 
 def test_fyers_same_epoch_different_close_is_a_conflict_not_a_duplicate():
@@ -600,7 +788,7 @@ def test_fyers_same_epoch_different_close_is_a_conflict_not_a_duplicate():
     row_b[4] = row_b[4] + 500.0  # same epoch (index 0), different close
     result = canonicalise_fyers_candles([row_a, row_b])
     assert len(result.frame) == 2, "both observations must survive"
-    assert "SOURCE_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
+    assert "CANONICAL_CONFLICTING_TIMESTAMPS" in anomaly_codes(result)
     assert "SOURCE_EXACT_DUPLICATE_ROWS" not in anomaly_codes(result)
 
 
