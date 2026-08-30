@@ -532,3 +532,110 @@ def test_mutation_target_canonicalise_before_checking(tmp_path):
     catching non-canonical data written directly to disk -- it would be
     silently re-sorted back into a passing frame instead of rejected."""
     test_noncanonical_data_on_disk_rejected(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Unit 10 correction round: restored ProvenanceEnvelope.build() invariants,
+# strict JSON constants, and wrapped ValidationPolicy errors, all exercised
+# at the read_trusted() level.
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_symbol_mismatch_rejected_by_trusted_reader(tmp_path):
+    ds, env, _ = _write_trusted(tmp_path)
+    path = _manifest_path(tmp_path, ds.identity, env.generation_id)
+    _tamper_manifest(path, lambda p: p["fetch"].__setitem__("symbol", "SBIN"))
+    with pytest.raises(TrustedReadError):
+        read_trusted(tmp_path, source="fyers:history", symbol="NIFTY", resolution="1")
+
+
+def test_fetch_resolution_mismatch_rejected_by_trusted_reader(tmp_path):
+    ds, env, _ = _write_trusted(tmp_path)
+    path = _manifest_path(tmp_path, ds.identity, env.generation_id)
+    _tamper_manifest(path, lambda p: p["fetch"].__setitem__("resolution", "5"))
+    with pytest.raises(TrustedReadError):
+        read_trusted(tmp_path, source="fyers:history", symbol="NIFTY", resolution="1")
+
+
+def test_namespace_trusted_with_forced_true_rejected_by_trusted_reader(tmp_path):
+    ds, env, _ = _write_trusted(tmp_path)
+    path = _manifest_path(tmp_path, ds.identity, env.generation_id)
+
+    def mutate(p):
+        p["forced"] = True
+        p["force_reason"] = "backfill"
+
+    _tamper_manifest(path, mutate)
+    with pytest.raises(TrustedReadError):
+        read_trusted(tmp_path, source="fyers:history", symbol="NIFTY", resolution="1")
+
+
+def test_namespace_trusted_with_force_reason_present_rejected_by_trusted_reader(tmp_path):
+    ds, env, _ = _write_trusted(tmp_path)
+    path = _manifest_path(tmp_path, ds.identity, env.generation_id)
+    _tamper_manifest(path, lambda p: p.__setitem__("force_reason", "not actually forced"))
+    with pytest.raises(TrustedReadError):
+        read_trusted(tmp_path, source="fyers:history", symbol="NIFTY", resolution="1")
+
+
+def test_nonstandard_json_nan_in_manifest_rejected_by_trusted_reader(tmp_path):
+    ds, env, _ = _write_trusted(tmp_path)
+    path = _manifest_path(tmp_path, ds.identity, env.generation_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    sigma_literal = json.dumps(payload["validation_policy"]["sigma_threshold"])
+    text = json.dumps(payload)
+    injected = text.replace(sigma_literal, "NaN", 1)
+    path.write_text(injected, encoding="utf-8")
+    with pytest.raises(TrustedReadError):
+        read_trusted(tmp_path, source="fyers:history", symbol="NIFTY", resolution="1")
+
+
+def test_invalid_validation_policy_cannot_escape_as_raw_value_error(tmp_path):
+    ds, env, _ = _write_trusted(tmp_path)
+    path = _manifest_path(tmp_path, ds.identity, env.generation_id)
+    _tamper_manifest(path, lambda p: p["validation_policy"].__setitem__("sigma_threshold", 0))
+    with pytest.raises(TrustedReadError):
+        read_trusted(tmp_path, source="fyers:history", symbol="NIFTY", resolution="1")
+
+
+def test_trusted_reader_forced_defense_in_depth_isolated(tmp_path, monkeypatch):
+    """Isolates the defense-in-depth forced/force_reason check in
+    read_trusted() from BOTH the parser's own invariant rejection AND the
+    digest-recomputation checks (forced/force_reason are themselves part of
+    what provenance_digest is computed over, so simply flipping them on an
+    already-parsed manifest would otherwise get caught by the digest
+    mismatch instead, masking whether this specific check does its own
+    job): monkeypatch ReconstructedManifest.from_manifest_json to return a
+    manifest object whose namespace is TRUSTED (so the namespace check
+    passes) but whose forced field is True, and ALSO monkeypatch its
+    recompute_provenance_digest/recompute_integrity_id to trivially agree
+    with its own stored digests -- a shape the real parser could never
+    produce, simulating a parser regression. read_trusted()'s OWN explicit
+    forced-must-be-False check must still catch it.
+    """
+    import dataclasses as _dc
+
+    import marketdata.trusted_reader as trusted_reader_module
+
+    ds, env, _ = _write_trusted(tmp_path)
+    real_from_manifest_json = trusted_reader_module.ReconstructedManifest.from_manifest_json
+
+    def patched(text):
+        manifest = real_from_manifest_json(text)
+        return _dc.replace(manifest, forced=True, force_reason="simulated parser regression")
+
+    monkeypatch.setattr(
+        trusted_reader_module.ReconstructedManifest, "from_manifest_json", staticmethod(patched)
+    )
+    monkeypatch.setattr(
+        trusted_reader_module.ReconstructedManifest,
+        "recompute_provenance_digest",
+        lambda self: self.provenance_digest,
+    )
+    monkeypatch.setattr(
+        trusted_reader_module.ReconstructedManifest,
+        "recompute_integrity_id",
+        lambda self: self.integrity_id,
+    )
+    with pytest.raises(TrustedReadError):
+        read_trusted(tmp_path, source="fyers:history", symbol="NIFTY", resolution="1")

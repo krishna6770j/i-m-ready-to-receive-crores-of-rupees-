@@ -753,3 +753,127 @@ def test_chunk_ok_as_int_rejected_by_manifest_parser():
     payload["fetch"]["chunks"][0]["ok"] = 1
     with pytest.raises(ManifestError):
         ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+# ---------------------------------------------------------------------------
+# Unit 10 correction round: strict JSON constants, wrapped ValidationPolicy
+# errors, and restored build()-time invariants.
+# ---------------------------------------------------------------------------
+
+
+def test_top_level_nan_rejected():
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json("NaN")
+
+
+def test_top_level_infinity_rejected():
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json("Infinity")
+
+
+def test_top_level_negative_infinity_rejected():
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json("-Infinity")
+
+
+def test_nested_nan_in_validation_policy_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    injected = manifest_json.replace(
+        json.dumps(payload["validation_policy"]["sigma_threshold"]),
+        "NaN",
+    )
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(injected)
+
+
+def test_nested_infinity_in_max_session_gap_days_rejected():
+    ds = _dataset(validation_policy=ValidationPolicy(max_session_gap_days=5.0))
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_snapshot())
+    manifest_json = env.to_manifest_json()
+    payload = json.loads(manifest_json)
+    injected = manifest_json.replace(
+        json.dumps(payload["validation_policy"]["max_session_gap_days"]),
+        "Infinity",
+    )
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(injected)
+
+
+def test_invalid_expected_interval_minutes_raises_manifest_error_not_raw():
+    ds = _dataset(validation_policy=ValidationPolicy(expected_interval_minutes=1))
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_snapshot())
+    payload = json.loads(env.to_manifest_json())
+    payload["validation_policy"]["expected_interval_minutes"] = 0
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_invalid_sigma_threshold_zero_raises_manifest_error_not_raw():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["validation_policy"]["sigma_threshold"] = 0
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_invalid_max_session_gap_days_negative_raises_manifest_error_not_raw():
+    ds = _dataset(validation_policy=ValidationPolicy(max_session_gap_days=5.0))
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_snapshot())
+    payload = json.loads(env.to_manifest_json())
+    payload["validation_policy"]["max_session_gap_days"] = -1.0
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_fetch_symbol_mismatch_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["fetch"]["symbol"] = "SBIN"
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_fetch_resolution_mismatch_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["fetch"]["resolution"] = "5"
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_namespace_trusted_with_forced_true_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["forced"] = True
+    payload["force_reason"] = "backfill"
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_namespace_forced_with_forced_false_rejected():
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds, forced=True, force_reason="backfill", fetch=_fetch_snapshot())
+    payload = json.loads(env.to_manifest_json())
+    payload["forced"] = False
+    payload["force_reason"] = None
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_forced_true_with_blank_force_reason_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["namespace"] = "FORCED"
+    payload["forced"] = True
+    payload["force_reason"] = "   "
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_forced_false_with_nonnull_force_reason_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["force_reason"] = "not actually forced"
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))

@@ -786,6 +786,23 @@ def _manifest_require_sha256_hex(value: object, field_name: str) -> str:
         raise ManifestError(str(exc)) from exc
 
 
+def _reject_json_constants(token: str) -> float:
+    """``parse_constant`` for ``json.loads``: raises on ``NaN``/``Infinity``/
+    ``-Infinity`` -- Python's ``json`` module accepts these as a
+    non-standard extension, but they are NOT valid JSON, and a numeric
+    field silently receiving ``float('nan')`` from a manifest is exactly
+    the kind of "malformed persisted data accepted anyway" defect this
+    parser exists to close. Applied recursively by ``json.loads`` at every
+    nesting level, so a NaN/Infinity buried inside a nested object (e.g.
+    ``validation_policy.sigma_threshold``) is caught identically to one at
+    the top level.
+    """
+    raise ManifestError(
+        f"manifest JSON contains the non-standard constant {token!r}; "
+        "NaN/Infinity/-Infinity are not valid JSON."
+    )
+
+
 def _reject_duplicate_manifest_keys(pairs: list) -> dict:
     """``object_pairs_hook`` for ``json.loads``: raises on any repeated key
     at any object level (applied recursively by ``json.loads`` to every
@@ -936,13 +953,20 @@ def _parse_validation_policy(payload: object) -> ValidationPolicy:
 
     # ValidationPolicy.__post_init__ performs its own type/bounds validation
     # and normalisation (int/float coercion, positivity, session_window
-    # re-tupling) -- reused here rather than duplicated.
-    return ValidationPolicy(
-        expected_interval_minutes=expected_interval,
-        sigma_threshold=sigma,
-        session_window=session_window,
-        max_session_gap_days=max_gap,
-    )
+    # re-tupling) -- reused here rather than duplicated. Its failures
+    # (ValueError/TypeError) are NOT this parser's domain error, so they are
+    # caught and re-raised as ManifestError -- manifest parsing has exactly
+    # ONE error boundary; a raw ValueError/TypeError escaping here would be
+    # a second, inconsistent one.
+    try:
+        return ValidationPolicy(
+            expected_interval_minutes=expected_interval,
+            sigma_threshold=sigma,
+            session_window=session_window,
+            max_session_gap_days=max_gap,
+        )
+    except (ValueError, TypeError) as exc:
+        raise ManifestError(f"validation_policy is invalid: {exc}") from exc
 
 
 def _parse_chunk(payload: object, index: int) -> ChunkResultSnapshot:
@@ -1067,7 +1091,11 @@ class ReconstructedManifest:
         recomputation -- see :meth:`recompute_provenance_digest`.
         """
         try:
-            payload = json.loads(text, object_pairs_hook=_reject_duplicate_manifest_keys)
+            payload = json.loads(
+                text,
+                object_pairs_hook=_reject_duplicate_manifest_keys,
+                parse_constant=_reject_json_constants,
+            )
         except json.JSONDecodeError as exc:
             raise ManifestError(f"manifest is not valid JSON: {exc}") from exc
 
@@ -1154,6 +1182,40 @@ class ReconstructedManifest:
 
         provenance_digest = _manifest_require_sha256_hex(payload["provenance_digest"], "manifest.provenance_digest")
         integrity_id = _manifest_require_sha256_hex(payload["integrity_id"], "manifest.integrity_id")
+
+        # Restore ProvenanceEnvelope.build()'s own invariants -- these are
+        # internally IMPOSSIBLE states under build(), so a manifest claiming
+        # one is not a coherent persisted envelope at all, regardless of
+        # whether its digests happen to be self-consistent.
+        if fetch is not None and (fetch.symbol != symbol or fetch.resolution != resolution):
+            raise ManifestError(
+                f"manifest.fetch describes symbol={fetch.symbol!r} "
+                f"resolution={fetch.resolution!r}, but manifest identity is "
+                f"symbol={symbol!r} resolution={resolution!r}."
+            )
+        if namespace is Namespace.TRUSTED and forced is not False:
+            raise ManifestError(
+                "manifest.namespace is TRUSTED but manifest.forced is not "
+                "False -- these are mutually exclusive (namespace is "
+                "derived from forced at build time)."
+            )
+        if namespace is Namespace.FORCED and forced is not True:
+            raise ManifestError(
+                "manifest.namespace is FORCED but manifest.forced is not "
+                "True -- these are mutually exclusive (namespace is "
+                "derived from forced at build time)."
+            )
+        if forced and not (isinstance(force_reason, str) and force_reason.strip()):
+            raise ManifestError(
+                "manifest.forced is True but force_reason is missing or "
+                "blank (frozen architecture section 10 requires a "
+                "non-empty reason)."
+            )
+        if not forced and force_reason is not None:
+            raise ManifestError(
+                "manifest.forced is False but force_reason is not null -- "
+                "a reason with no force is not a coherent build() output."
+            )
 
         return cls(
             provenance_schema_version=provenance_schema_version,

@@ -591,6 +591,22 @@ def read_trusted(root: Path, *, source: str, symbol: str, resolution: str) -> Tr
         raise TrustedReadError(
             f"Manifest namespace is {manifest.namespace.value}, expected TRUSTED."
         )
+    # Defense-in-depth: ReconstructedManifest.from_manifest_json() already
+    # rejects namespace/forced/force_reason inconsistency as a structurally
+    # impossible manifest, but this trust boundary does not rely on that
+    # ALONE -- forced/force_reason are checked explicitly here too, so a
+    # future change to the parser's own invariant check can never silently
+    # widen what read_trusted() accepts.
+    if manifest.forced is not False:
+        raise TrustedReadError(
+            f"Manifest forced is {manifest.forced!r}, expected False for a "
+            "TRUSTED read."
+        )
+    if manifest.force_reason is not None:
+        raise TrustedReadError(
+            f"Manifest force_reason is {manifest.force_reason!r}, expected "
+            "None for a TRUSTED read."
+        )
 
     manifest_identity = DatasetIdentity(
         source=manifest.source, symbol=manifest.symbol, resolution=manifest.resolution
