@@ -95,6 +95,7 @@ imports it from there too and its own tests are unaffected.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import struct
 import uuid
@@ -277,6 +278,44 @@ def _encode_value(value: Any) -> bytes:
         f"Cannot encode value of type {type(value).__name__!r} into the "
         "provenance envelope; no unambiguous typed representation is "
         "defined for it."
+    )
+
+
+def _to_jsonable(value: Any) -> Any:
+    """Recursively convert one Python value into a JSON-safe structure.
+
+    Same shape-coverage as ``_encode_value`` (dataclasses via
+    ``dataclasses.fields()`` in their unchanging declaration order,
+    tuples/lists, mappings sorted by key, enums, UUIDs, ``datetime.time``),
+    but targeting JSON primitives instead of binary framing -- this is what
+    ``ProvenanceEnvelope.to_manifest_dict()``/``to_manifest_json()`` use to
+    persist a generation's provenance envelope losslessly enough for a
+    later unit to reconstruct and re-verify it, per manager direction for
+    Unit 8 (generation storage): "manifest must contain the fields required
+    to recompute provenance_digest/integrity_id/...". Field NAMES are
+    included for every dataclass, matching ``_encode_value``'s self-
+    describing structure.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, _time):
+        return value.isoformat()
+    if isinstance(value, (tuple, list)):
+        return [_to_jsonable(v) for v in value]
+    if isinstance(value, Mapping):
+        return {
+            str(k): _to_jsonable(v)
+            for k, v in sorted(value.items(), key=lambda kv: str(kv[0]))
+        }
+    if is_dataclass(value) and not isinstance(value, type):
+        return {f.name: _to_jsonable(getattr(value, f.name)) for f in dataclass_fields(value)}
+    raise TypeError(
+        f"Cannot convert value of type {type(value).__name__!r} into a "
+        "JSON-safe manifest value; no representation is defined for it."
     )
 
 
@@ -559,3 +598,45 @@ class ProvenanceEnvelope:
     @property
     def integrity_id(self) -> str:
         return self._integrity_id
+
+    # -- manifest persistence (Unit 8: marketdata/generation_store.py) -----
+
+    def to_manifest_dict(self) -> dict:
+        """A JSON-safe ``dict`` capturing every field this envelope binds,
+        losslessly enough for a later unit to reconstruct and re-verify
+        ``provenance_digest``/``integrity_id`` from the persisted manifest
+        alone. Includes the digests themselves (for direct cross-check
+        without recomputation) as well as every field ``provenance_digest``
+        was actually computed from.
+
+        This is NOT the same encoding ``_encode_envelope()`` produces
+        (that one is binary, framed, and excludes ``data_digest`` on
+        purpose -- see the module docstring); this is a separate,
+        JSON-oriented serialisation whose only job is faithful persistence.
+        """
+        return {
+            "provenance_schema_version": self._provenance_schema_version,
+            "market_data_schema_version": self._market_data_schema_version,
+            "source": self._source,
+            "symbol": self._symbol,
+            "resolution": self._resolution,
+            "generation_id": str(self._generation_id),
+            "namespace": self._namespace.value,
+            "data_digest": self._data_digest,
+            "transformations": [_to_jsonable(t) for t in self._transformations],
+            "source_anomalies": [_to_jsonable(a) for a in self._source_anomalies],
+            "source_evidence": _to_jsonable(self._source_evidence),
+            "validation_policy": _to_jsonable(self._validation_policy),
+            "fetch": _to_jsonable(self._fetch) if self._fetch is not None else None,
+            "forced": self._forced,
+            "force_reason": self._force_reason,
+            "software": _to_jsonable(self._software),
+            "provenance_digest": self._provenance_digest,
+            "integrity_id": self._integrity_id,
+        }
+
+    def to_manifest_json(self) -> str:
+        """Canonical JSON of :meth:`to_manifest_dict`: sorted keys, compact
+        separators, deterministic for a fixed envelope.
+        """
+        return json.dumps(self.to_manifest_dict(), sort_keys=True, separators=(",", ":"))

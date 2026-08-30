@@ -1,0 +1,460 @@
+"""Atomic generation storage tests.
+
+Frozen architecture sections 10 and 13.3. All tests use temporary
+directories only.
+"""
+
+from __future__ import annotations
+
+import uuid
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+import marketdata.generation_store as generation_store
+from core.timeutils import IST_NAME
+from marketdata.dataset import ValidatedDataset
+from marketdata.generation_store import (
+    GenerationAlreadyExistsError,
+    GenerationConsistencyError,
+    GenerationWriteResult,
+    write_generation,
+)
+from marketdata.identity import DatasetIdentity
+from marketdata.locator import CurrentPointer, safe_slug
+from marketdata.provenance import Namespace, ProvenanceEnvelope
+from marketdata.schemas import CLOSE, HIGH, LOW, OPEN, TS, VOLUME
+
+
+def _identity(**overrides) -> DatasetIdentity:
+    fields = {"source": "fyers:history", "symbol": "NIFTY", "resolution": "1"}
+    fields.update(overrides)
+    return DatasetIdentity(**fields)
+
+
+def _frame(n: int = 3, *, base: float = 100.0) -> pd.DataFrame:
+    ts0 = pd.Timestamp("2026-01-01 09:15", tz=IST_NAME)
+    rows = []
+    for i in range(n):
+        rows.append(
+            {
+                TS: ts0 + pd.Timedelta(minutes=i),
+                OPEN: base + i,
+                HIGH: base + i + 5,
+                LOW: base + i - 5,
+                CLOSE: base + i + 1,
+                VOLUME: 1000 + i,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _dataset(*, base: float = 100.0, **identity_overrides) -> ValidatedDataset:
+    return ValidatedDataset.build(_frame(base=base), identity=_identity(**identity_overrides))
+
+
+def _current_path(result: GenerationWriteResult) -> Path:
+    return result.generation_dir.parent.parent / "CURRENT"
+
+
+def _dataset_dir_for(root: Path, envelope: ProvenanceEnvelope) -> Path:
+    return (
+        root
+        / safe_slug(envelope.source)
+        / safe_slug(envelope.symbol)
+        / safe_slug(envelope.resolution)
+    )
+
+
+# ---------------------------------------------------------------------------
+# basic trusted/forced behaviour
+# ---------------------------------------------------------------------------
+
+
+def test_first_trusted_write_creates_complete_generation_and_current(tmp_path):
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds)
+    result = write_generation(ds, env, tmp_path)
+
+    assert result.namespace is Namespace.TRUSTED
+    assert result.current_updated is True
+    assert (result.generation_dir / "data.parquet").exists()
+    assert (result.generation_dir / "manifest.json").exists()
+
+    current_path = _current_path(result)
+    assert current_path.exists()
+    pointer = CurrentPointer.from_json(current_path.read_text())
+    assert pointer.generation_id == env.generation_id
+    assert pointer.integrity_id == env.integrity_id
+
+
+def test_second_trusted_write_advances_current_only_after_full_generation_exists(tmp_path):
+    identity_kwargs = {}
+    ds1 = _dataset(base=100.0, **identity_kwargs)
+    env1 = ProvenanceEnvelope.build(ds1)
+    result1 = write_generation(ds1, env1, tmp_path)
+
+    ds2 = _dataset(base=200.0, **identity_kwargs)
+    env2 = ProvenanceEnvelope.build(ds2)
+    result2 = write_generation(ds2, env2, tmp_path)
+
+    current_path = _current_path(result1)
+    pointer = CurrentPointer.from_json(current_path.read_text())
+    assert pointer.generation_id == env2.generation_id
+
+    # gen1 remains fully intact.
+    assert (result1.generation_dir / "data.parquet").exists()
+    assert (result1.generation_dir / "manifest.json").exists()
+    assert result2.generation_dir != result1.generation_dir
+
+
+def test_forced_write_creates_forced_generation_and_leaves_current_unchanged(tmp_path):
+    ds1 = _dataset(base=100.0)
+    env1 = ProvenanceEnvelope.build(ds1)
+    result1 = write_generation(ds1, env1, tmp_path)
+    current_path = _current_path(result1)
+    before = current_path.read_text()
+
+    ds2 = _dataset(base=300.0)
+    env2 = ProvenanceEnvelope.build(ds2, forced=True, force_reason="backfill")
+    result2 = write_generation(ds2, env2, tmp_path)
+
+    assert result2.namespace is Namespace.FORCED
+    assert result2.current_updated is False
+    assert "forced_generations" in str(result2.generation_dir)
+    assert current_path.read_text() == before
+
+
+def test_forced_generation_can_never_become_current_even_as_first_write(tmp_path):
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds, forced=True, force_reason="manual import")
+    result = write_generation(ds, env, tmp_path)
+    current_path = _current_path(result)
+    assert not current_path.exists()
+
+
+def test_current_points_to_trusted_namespace_only(tmp_path):
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds)
+    result = write_generation(ds, env, tmp_path)
+    assert "trusted_generations" in str(result.generation_dir)
+    assert "forced_generations" not in str(result.generation_dir)
+
+
+# ---------------------------------------------------------------------------
+# consistency checks
+# ---------------------------------------------------------------------------
+
+
+def test_mismatched_dataset_and_envelope_rejected_before_write(tmp_path):
+    ds_a = _dataset(base=100.0)
+    ds_b = _dataset(base=999.0)
+    env_b = ProvenanceEnvelope.build(ds_b)  # built from ds_b, not ds_a
+
+    with pytest.raises(GenerationConsistencyError):
+        write_generation(ds_a, env_b, tmp_path)
+
+    # No filesystem mutation happened at all.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_data_digest_mismatch_rejected_before_any_write(tmp_path):
+    ds_a = _dataset(base=1.0)
+    ds_b = _dataset(base=2.0)
+    env_b = ProvenanceEnvelope.build(ds_b)
+    assert ds_a.digest != env_b.data_digest
+
+    with pytest.raises(GenerationConsistencyError):
+        write_generation(ds_a, env_b, tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_generation_identity_mismatch_rejected(tmp_path):
+    ds = _dataset(symbol="NIFTY")
+    env_other_symbol = ProvenanceEnvelope.build(_dataset(symbol="SBIN"))
+    with pytest.raises(GenerationConsistencyError):
+        write_generation(ds, env_other_symbol, tmp_path)
+
+
+def test_fake_dataset_rejected():
+    class FakeDataset:
+        pass
+
+    with pytest.raises(TypeError):
+        write_generation(FakeDataset(), ProvenanceEnvelope.build(_dataset()), Path("/tmp/x"))
+
+
+# ---------------------------------------------------------------------------
+# path safety
+# ---------------------------------------------------------------------------
+
+
+def test_raw_dangerous_identifiers_stay_inside_safe_slug_paths(tmp_path):
+    ds = _dataset(source="../../etc", symbol="../passwd", resolution="../1")
+    env = ProvenanceEnvelope.build(ds)
+    result = write_generation(ds, env, tmp_path)
+
+    resolved = result.generation_dir.resolve()
+    assert str(resolved).startswith(str(tmp_path.resolve()))
+    assert ".." not in result.generation_dir.parts
+
+
+# ---------------------------------------------------------------------------
+# no overwrite
+# ---------------------------------------------------------------------------
+
+
+def test_existing_generation_never_overwritten(tmp_path):
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds)
+    result = write_generation(ds, env, tmp_path)
+
+    original_manifest = (result.generation_dir / "manifest.json").read_text()
+
+    with pytest.raises(GenerationAlreadyExistsError):
+        write_generation(ds, env, tmp_path)
+
+    assert (result.generation_dir / "manifest.json").read_text() == original_manifest
+
+
+# ---------------------------------------------------------------------------
+# manifest/data both present before CURRENT update
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_and_data_both_present_before_current_written(tmp_path):
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds)
+    result = write_generation(ds, env, tmp_path)
+    assert (result.generation_dir / "data.parquet").exists()
+    assert (result.generation_dir / "manifest.json").exists()
+    assert _current_path(result).exists()
+
+
+# ---------------------------------------------------------------------------
+# exact write-sequence / ordering
+# ---------------------------------------------------------------------------
+
+
+def test_write_sequence_order_matches_architecture(tmp_path, monkeypatch):
+    calls: list[tuple] = []
+
+    orig_write_parquet = generation_store._write_data_parquet
+    orig_write_text = generation_store._write_text
+    orig_fsync_file = generation_store._fsync_file
+    orig_fsync_dir = generation_store._fsync_dir
+    orig_replace = generation_store._atomic_replace
+
+    def write_parquet(path, frame):
+        calls.append(("write_data_parquet", Path(path).name))
+        return orig_write_parquet(path, frame)
+
+    def write_text(path, text):
+        calls.append(("write_text", Path(path).name))
+        return orig_write_text(path, text)
+
+    def fsync_file(path):
+        calls.append(("fsync_file", Path(path).name))
+        return orig_fsync_file(path)
+
+    def fsync_dir(path):
+        calls.append(("fsync_dir", Path(path).name))
+        return orig_fsync_dir(path)
+
+    def replace(tmp, target):
+        calls.append(("replace", None))
+        return orig_replace(tmp, target)
+
+    monkeypatch.setattr(generation_store, "_write_data_parquet", write_parquet)
+    monkeypatch.setattr(generation_store, "_write_text", write_text)
+    monkeypatch.setattr(generation_store, "_fsync_file", fsync_file)
+    monkeypatch.setattr(generation_store, "_fsync_dir", fsync_dir)
+    monkeypatch.setattr(generation_store, "_atomic_replace", replace)
+
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds)
+    result = write_generation(ds, env, tmp_path)
+
+    gid = str(env.generation_id)
+    dataset_dir_name = safe_slug(env.resolution)
+
+    assert calls == [
+        ("write_data_parquet", "data.parquet"),
+        ("fsync_file", "data.parquet"),
+        ("write_text", "manifest.json"),
+        ("fsync_file", "manifest.json"),
+        ("fsync_dir", gid),
+        ("fsync_dir", "trusted_generations"),
+        ("write_text", "CURRENT.tmp"),
+        ("fsync_file", "CURRENT.tmp"),
+        ("replace", None),
+        ("fsync_dir", dataset_dir_name),
+    ]
+
+
+def test_forced_write_sequence_has_no_current_steps(tmp_path, monkeypatch):
+    calls: list[str] = []
+    orig_replace = generation_store._atomic_replace
+
+    def replace(tmp, target):
+        calls.append("replace")
+        return orig_replace(tmp, target)
+
+    monkeypatch.setattr(generation_store, "_atomic_replace", replace)
+
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds, forced=True, force_reason="x")
+    write_generation(ds, env, tmp_path)
+
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# failure injection
+# ---------------------------------------------------------------------------
+
+
+def test_failed_parquet_write_leaves_current_unchanged(tmp_path, monkeypatch):
+    ds0 = _dataset(base=1.0)
+    env0 = ProvenanceEnvelope.build(ds0)
+    result0 = write_generation(ds0, env0, tmp_path)
+    current_before = _current_path(result0).read_text()
+
+    def boom(path, frame):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(generation_store, "_write_data_parquet", boom)
+
+    ds1 = _dataset(base=2.0)
+    env1 = ProvenanceEnvelope.build(ds1)
+    with pytest.raises(OSError):
+        write_generation(ds1, env1, tmp_path)
+
+    assert _current_path(result0).read_text() == current_before
+    # Orphan generation directory exists but has no data file.
+    orphan_dir = _dataset_dir_for(tmp_path, env1) / "trusted_generations" / str(env1.generation_id)
+    assert orphan_dir.exists()
+    assert not (orphan_dir / "data.parquet").exists()
+
+
+def test_failed_manifest_write_leaves_current_unchanged(tmp_path, monkeypatch):
+    ds0 = _dataset(base=1.0)
+    env0 = ProvenanceEnvelope.build(ds0)
+    result0 = write_generation(ds0, env0, tmp_path)
+    current_before = _current_path(result0).read_text()
+
+    orig_write_text = generation_store._write_text
+
+    def selective_boom(path, text):
+        if Path(path).name == "manifest.json":
+            raise OSError("simulated disk failure")
+        return orig_write_text(path, text)
+
+    monkeypatch.setattr(generation_store, "_write_text", selective_boom)
+
+    ds1 = _dataset(base=2.0)
+    env1 = ProvenanceEnvelope.build(ds1)
+    with pytest.raises(OSError):
+        write_generation(ds1, env1, tmp_path)
+
+    assert _current_path(result0).read_text() == current_before
+    orphan_dir = _dataset_dir_for(tmp_path, env1) / "trusted_generations" / str(env1.generation_id)
+    assert (orphan_dir / "data.parquet").exists()
+    assert not (orphan_dir / "manifest.json").exists()
+
+
+def test_failed_current_tmp_write_leaves_current_unchanged(tmp_path, monkeypatch):
+    ds0 = _dataset(base=1.0)
+    env0 = ProvenanceEnvelope.build(ds0)
+    result0 = write_generation(ds0, env0, tmp_path)
+    current_before = _current_path(result0).read_text()
+
+    orig_write_text = generation_store._write_text
+
+    def selective_boom(path, text):
+        if Path(path).name == "CURRENT.tmp":
+            raise OSError("simulated disk failure")
+        return orig_write_text(path, text)
+
+    monkeypatch.setattr(generation_store, "_write_text", selective_boom)
+
+    ds1 = _dataset(base=2.0)
+    env1 = ProvenanceEnvelope.build(ds1)
+    with pytest.raises(OSError):
+        write_generation(ds1, env1, tmp_path)
+
+    assert _current_path(result0).read_text() == current_before
+    # The new generation itself is fully written (data + manifest); only
+    # the CURRENT advance failed.
+    orphan_dir = _dataset_dir_for(tmp_path, env1) / "trusted_generations" / str(env1.generation_id)
+    assert (orphan_dir / "data.parquet").exists()
+    assert (orphan_dir / "manifest.json").exists()
+
+
+def test_failed_os_replace_leaves_current_unchanged(tmp_path, monkeypatch):
+    ds0 = _dataset(base=1.0)
+    env0 = ProvenanceEnvelope.build(ds0)
+    result0 = write_generation(ds0, env0, tmp_path)
+    current_before = _current_path(result0).read_text()
+
+    def boom(tmp, target):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(generation_store, "_atomic_replace", boom)
+
+    ds1 = _dataset(base=2.0)
+    env1 = ProvenanceEnvelope.build(ds1)
+    with pytest.raises(OSError):
+        write_generation(ds1, env1, tmp_path)
+
+    assert _current_path(result0).read_text() == current_before
+
+
+def test_orphan_generation_is_inert(tmp_path, monkeypatch):
+    ds0 = _dataset(base=1.0)
+    env0 = ProvenanceEnvelope.build(ds0)
+    result0 = write_generation(ds0, env0, tmp_path)
+
+    def boom(tmp, target):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(generation_store, "_atomic_replace", boom)
+
+    ds1 = _dataset(base=2.0)
+    env1 = ProvenanceEnvelope.build(ds1)
+    with pytest.raises(OSError):
+        write_generation(ds1, env1, tmp_path)
+
+    # CURRENT still resolves to gen0, not the orphan gen1.
+    pointer = CurrentPointer.from_json(_current_path(result0).read_text())
+    assert pointer.generation_id == env0.generation_id
+    assert pointer.generation_id != env1.generation_id
+
+    # The orphan is still there on disk (not cleaned up), but nothing
+    # references it.
+    orphan_dir = _dataset_dir_for(tmp_path, env1) / "trusted_generations" / str(env1.generation_id)
+    assert orphan_dir.exists()
+
+
+def test_previous_trusted_generation_remains_intact_after_failed_new_write(tmp_path, monkeypatch):
+    ds0 = _dataset(base=1.0)
+    env0 = ProvenanceEnvelope.build(ds0)
+    result0 = write_generation(ds0, env0, tmp_path)
+    original_data = (result0.generation_dir / "data.parquet").read_bytes()
+    original_manifest = (result0.generation_dir / "manifest.json").read_text()
+
+    def boom(path, frame):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(generation_store, "_write_data_parquet", boom)
+
+    ds1 = _dataset(base=2.0)
+    env1 = ProvenanceEnvelope.build(ds1)
+    with pytest.raises(OSError):
+        write_generation(ds1, env1, tmp_path)
+
+    assert (result0.generation_dir / "data.parquet").read_bytes() == original_data
+    assert (result0.generation_dir / "manifest.json").read_text() == original_manifest
+    pointer = CurrentPointer.from_json(_current_path(result0).read_text())
+    assert pointer.generation_id == env0.generation_id
