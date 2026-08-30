@@ -297,6 +297,59 @@ def test_manifest_snapshot_unaffected_by_nested_dict_mutation():
     assert snap.cleaning["nested"]["a"] == 1
 
 
+def test_manifest_snapshot_freezes_dict_nested_inside_a_tuple():
+    # tuple -> dict: a dict living inside a tuple must itself become an
+    # immutable MappingProxyType, not be left reachable/mutable just because
+    # its container is already a tuple.
+    manifest = _manifest()
+    manifest.cleaning["nested"] = ({"a": 1},)
+    snap = snapshot_manifest(manifest)
+
+    inner_dict = snap.cleaning["nested"][0]
+    assert isinstance(inner_dict, MappingProxyType)
+    with pytest.raises(TypeError):
+        inner_dict["a"] = 999
+
+
+def test_manifest_snapshot_freezes_dict_nested_via_list_then_tuple():
+    # list -> tuple -> dict
+    manifest = _manifest()
+    manifest.cleaning["nested"] = [({"a": 1},)]
+    snap = snapshot_manifest(manifest)
+
+    inner_dict = snap.cleaning["nested"][0][0]
+    assert isinstance(inner_dict, MappingProxyType)
+    with pytest.raises(TypeError):
+        inner_dict["a"] = 999
+
+
+def test_manifest_snapshot_freezes_dict_nested_via_dict_tuple_list_dict():
+    # dict -> tuple -> list -> dict
+    manifest = _manifest()
+    manifest.cleaning["nested"] = ([{"a": 1}],)
+    snap = snapshot_manifest(manifest)
+
+    inner_list = snap.cleaning["nested"][0]
+    assert isinstance(inner_list, tuple)
+    inner_dict = inner_list[0]
+    assert isinstance(inner_dict, MappingProxyType)
+    with pytest.raises(TypeError):
+        inner_dict["a"] = 999
+
+
+def test_manifest_snapshot_unaffected_by_mutation_through_deep_nesting():
+    # Proves the snapshot stays unchanged even when the SOURCE is mutated
+    # through several layers of nesting after the snapshot was taken.
+    manifest = _manifest()
+    original_inner = {"a": 1}
+    manifest.cleaning["nested"] = ([original_inner],)
+    snap = snapshot_manifest(manifest)
+
+    original_inner["a"] = 999  # mutate the dict the source still references
+
+    assert snap.cleaning["nested"][0][0]["a"] == 1
+
+
 def test_manifest_snapshot_nested_collections_are_immutable():
     snap = snapshot_manifest(_manifest())
     assert isinstance(snap.failed_chunks, tuple)
@@ -327,14 +380,35 @@ def test_manifest_snapshot_creation_is_deterministic():
     assert snap1 == snap2
 
 
-def test_manifest_snapshot_is_authoritative_property():
-    manifest = _manifest()
-    snap = snapshot_manifest(manifest)
-    assert snap.is_authoritative == manifest.is_authoritative is True
+def test_manifest_snapshot_has_no_is_authoritative_attribute():
+    # The frozen architecture withdrew is_authoritative as a concept: a
+    # manifest asserting its own trustworthiness from
+    # validation_status/fetch_status/forced is exactly the pattern section 3
+    # identifies as the root cause of the baseline's defects. This snapshot
+    # stores evidence only; trust is a later, explicitly authorised layer's
+    # decision.
+    snap = snapshot_manifest(_manifest())
+    assert not hasattr(snap, "is_authoritative")
+    assert "is_authoritative" not in {f.name for f in dataclasses.fields(snap)}
 
-    forced_manifest = _manifest()
-    forced_manifest.forced = True
-    assert snapshot_manifest(forced_manifest).is_authoritative is False
+
+def test_manifest_snapshot_does_not_interpret_inconsistent_evidence():
+    # fetch_status="complete" together with a non-empty failed_chunks list is
+    # an internally inconsistent manifest (the kind DatasetManifest.forced
+    # writes can produce). The snapshot must preserve both raw facts exactly
+    # as given -- it must not resolve, hide, or silently correct the
+    # contradiction, and it exposes no verdict (is_authoritative, is_valid,
+    # is_complete, ...) that could paper over it.
+    manifest = _manifest()
+    manifest.fetch_status = "complete"
+    manifest.failed_chunks = [{"from": "2026-01-01", "to": "2026-01-02", "error": "boom"}]
+    snap = snapshot_manifest(manifest)
+
+    assert snap.fetch_status == "complete"
+    assert len(snap.failed_chunks) == 1
+    assert not hasattr(snap, "is_authoritative")
+    assert not hasattr(snap, "is_valid")
+    assert not hasattr(snap, "is_complete")
 
 
 # ---------------------------------------------------------------------------

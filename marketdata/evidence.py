@@ -31,7 +31,8 @@ from marketdata.validator import Severity, ValidationIssue, ValidationReport
 
 
 def _freeze(value: Any) -> Any:
-    """Recursively convert ``dict``/``list`` into immutable equivalents.
+    """Recursively convert ``dict``/``list``/``tuple`` into immutable
+    equivalents, at EVERY nesting level.
 
     Builds entirely new containers (dict comprehension, generator-to-tuple)
     rather than wrapping the originals in place, so mutating the SOURCE
@@ -39,11 +40,21 @@ def _freeze(value: Any) -> Any:
     alone would not be enough: it blocks writes through the *same* dict
     object, but the manifest fields this is applied to (``requested_range``,
     ``cleaning``, ``software``, ``failed_chunks``) are plain caller-supplied
-    dicts/lists, and only a fresh copy at every level severs that reference.
+    JSON-like data, which can nest dicts/lists inside each other in any
+    combination -- ``{"x": [{"a": 1}]}``, a list of dicts, a dict whose value
+    is itself a list of lists, and so on.
+
+    Recursion must also descend into ``tuple``, not just ``dict``/``list``:
+    a value that is ALREADY a tuple (for example, a tuple this same function
+    produced from an outer ``list``) can still hold a mutable ``dict``
+    element -- ``({"a": 1},)`` -- and skipping tuples would leave that inner
+    dict reachable and mutable. Recursing into tuples too, rather than
+    treating them as already-safe leaves, is what makes this genuinely deep
+    rather than only one level deep.
     """
     if isinstance(value, dict):
         return MappingProxyType({k: _freeze(v) for k, v in value.items()})
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return tuple(_freeze(v) for v in value)
     return value
 
@@ -195,6 +206,19 @@ class ManifestSnapshot:
     manifest (JSON-serialisable provenance detail, not domain types) --
     frozen recursively via ``_freeze`` into ``tuple``/``MappingProxyType``
     so no nested mutable container survives into the snapshot.
+
+    Deliberately does NOT expose ``is_authoritative`` (or any other derived
+    trust verdict). The frozen architecture withdrew that concept: baseline
+    ``DatasetManifest.is_authoritative`` combines ``validation_status``,
+    ``fetch_status`` and ``forced`` into a single boolean the manifest
+    asserts about itself, which is exactly the "trusts an assertion instead
+    of deriving a fact" pattern the architecture's problem statement
+    (section 3) identifies as the root cause of the baseline's defects. This
+    type stores EVIDENCE -- the raw legacy fields, preserved as-is for a
+    later migration -- and computes no verdict from it. Whether a dataset is
+    trustworthy is a decision for a later, explicitly authorised trust layer
+    (``TrustedDataset``/``ValidatedDataset``, architecture section 12), not
+    for this snapshot.
     """
 
     symbol: str
@@ -217,14 +241,6 @@ class ManifestSnapshot:
     software: MappingProxyType
     forced: bool
     notes: str
-
-    @property
-    def is_authoritative(self) -> bool:
-        return (
-            self.validation_status == "valid"
-            and self.fetch_status == "complete"
-            and not self.forced
-        )
 
 
 def snapshot_manifest(manifest: DatasetManifest) -> ManifestSnapshot:
