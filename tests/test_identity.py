@@ -17,7 +17,12 @@ import pandas as pd
 import pytest
 
 from core.timeutils import IST_NAME
-from marketdata.identity import DatasetIdentity, DatasetIdentityError, dataset_digest
+from marketdata.identity import (
+    DatasetIdentity,
+    DatasetIdentityError,
+    _encode_dataset,
+    dataset_digest,
+)
 from marketdata.schemas import (
     CLOSE,
     HIGH,
@@ -455,3 +460,212 @@ def test_dataset_identity_has_no_secret_fields():
     identity = _identity()
     field_names = {f.name for f in identity.__dataclass_fields__.values()}
     assert field_names == {"source", "symbol", "resolution"}
+
+
+# ============================================================================
+# Section 8.3: equal-timestamp identity ordering (docs/architecture/
+# phase1-trust-hardening.md). Source arrival order within a shared timestamp
+# is provenance, not dataset identity: canonicalise()'s stable sort correctly
+# preserves that arrival order in CanonicalisationResult.frame, but the digest
+# must order equal-timestamp observations by their own canonical encoded
+# non-timestamp bytes, not by arrival position.
+# ============================================================================
+
+_T1 = "2026-01-01 09:15"
+_T2 = "2026-01-01 09:16"
+_T3 = "2026-01-01 09:17"
+
+_OBS_A = (100.0, 101.0, 99.0, 100.5, 1000)
+_OBS_B = (200.0, 201.0, 199.0, 200.5, 2000)
+_OBS_C = (300.0, 301.0, 299.0, 300.5, 3000)
+_OBS_D = (400.0, 401.0, 399.0, 400.5, 4000)
+_OBS_E = (410.0, 411.0, 409.0, 410.5, 4100)
+_OBS_F = (420.0, 421.0, 419.0, 420.5, 4200)
+_OBS_NAN = (float("nan"), 1.0, 1.0, 1.0, 1)
+_OBS_VOL_NA = (500.0, 501.0, 499.0, 500.5, None)
+_OBS_ZERO_POS = (0.0, 1.0, 1.0, 1.0, 1)
+_OBS_ZERO_NEG = (-0.0, 1.0, 1.0, 1.0, 1)
+
+# Captured directly against commit 6239148 (before the section 8.3
+# correction), using the unique-timestamp _BASE_ROWS fixture already defined
+# above. Architecture section 8.3, item 7: datasets with no repeated
+# timestamp are unaffected by this correction -- this is the compatibility
+# proof that the fix does not gratuitously invalidate ordinary Unit-3 hashes.
+_KNOWN_PRE_FIX_UNIQUE_TIMESTAMP_DIGEST = (
+    "bcbd610d113aa6e21febdf6f118e25783644dc99357d16780aca6543af1afda9"
+)
+
+
+def _grouped_frame(ts: str, observations: list[tuple]) -> pd.DataFrame:
+    return _frame([(ts, *obs) for obs in observations])
+
+
+def _multi_group_frame(groups: list[tuple[str, list[tuple]]]) -> pd.DataFrame:
+    rows = []
+    for ts, observations in groups:
+        for obs in observations:
+            rows.append((ts, *obs))
+    return _frame(rows)
+
+
+def test_unique_timestamp_digest_unchanged_by_ordering_correction():
+    assert (
+        dataset_digest(_identity(), _frame(_BASE_ROWS))
+        == _KNOWN_PRE_FIX_UNIQUE_TIMESTAMP_DIGEST
+    )
+
+
+# --- A: T:A,B vs T:B,A -> SAME ------------------------------------------------
+
+
+def test_equal_timestamp_ab_vs_ba_same_digest():
+    identity = _identity()
+    d1 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_A, _OBS_B]))
+    d2 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_B, _OBS_A]))
+    assert d1 == d2
+
+
+# --- B: T:A,A,B vs T:B,A,A -> SAME --------------------------------------------
+
+
+def test_equal_timestamp_aab_vs_baa_same_digest():
+    identity = _identity()
+    d1 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_A, _OBS_A, _OBS_B]))
+    d2 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_B, _OBS_A, _OBS_A]))
+    assert d1 == d2
+
+
+def test_equal_timestamp_multiplicity_distinguishes_same_distinct_set():
+    # T:A,A,B and T:A,B,B share the same DISTINCT observation set {A, B} and
+    # the same total row count (3), differing only in how many times each
+    # occurs. A tie-break that deduplicates within a timestamp group (rather
+    # than only sorting) would collapse both to the same two-element result
+    # and collide -- the frame-level row_count field alone does not catch
+    # this, since it is identical for both frames.
+    identity = _identity()
+    d_aab = dataset_digest(identity, _grouped_frame(_T1, [_OBS_A, _OBS_A, _OBS_B]))
+    d_abb = dataset_digest(identity, _grouped_frame(_T1, [_OBS_A, _OBS_B, _OBS_B]))
+    assert d_aab != d_abb
+
+
+# --- C: T:A vs T:A,A -> DIFFERENT ---------------------------------------------
+
+
+def test_equal_timestamp_a_vs_aa_different_digest():
+    identity = _identity()
+    d1 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_A]))
+    d2 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_A, _OBS_A]))
+    assert d1 != d2
+
+
+# --- D: T:A,B vs T:A,C -> DIFFERENT -------------------------------------------
+
+
+def test_equal_timestamp_ab_vs_ac_different_digest():
+    identity = _identity()
+    d1 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_A, _OBS_B]))
+    d2 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_A, _OBS_C]))
+    assert d1 != d2
+
+
+# --- E: NaN-bearing equal-timestamp group, reordered source -> SAME ----------
+
+
+def test_equal_timestamp_group_with_nan_reordered_same_digest():
+    identity = _identity()
+    d1 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_NAN, _OBS_A]))
+    d2 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_A, _OBS_NAN]))
+    assert d1 == d2
+
+
+# --- F: volume-NA-bearing equal-timestamp group, reordered source -> SAME ----
+
+
+def test_equal_timestamp_group_with_volume_na_reordered_same_digest():
+    identity = _identity()
+    d1 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_VOL_NA, _OBS_A]))
+    d2 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_A, _OBS_VOL_NA]))
+    assert d1 == d2
+
+
+# --- G: +0.0 / -0.0 within an equal-timestamp group -> deterministic ---------
+
+
+def test_equal_timestamp_group_with_signed_zero_deterministic():
+    identity = _identity()
+    d1 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_ZERO_POS, _OBS_A]))
+    d2 = dataset_digest(identity, _grouped_frame(_T1, [_OBS_ZERO_NEG, _OBS_A]))
+    # +0.0 and -0.0 collapse to the identical encoded bytes (section 8.2), so
+    # they are indistinguishable for both the tie-break sort and the digest.
+    assert d1 == d2
+
+
+# --- multi-group: only within-group reordering must be identity-preserving --
+
+
+def test_multi_group_within_group_reordering_same_digest():
+    identity = _identity()
+    groups1 = [(_T1, [_OBS_A, _OBS_B]), (_T2, [_OBS_C]), (_T3, [_OBS_D, _OBS_E, _OBS_F])]
+    groups2 = [(_T1, [_OBS_B, _OBS_A]), (_T2, [_OBS_C]), (_T3, [_OBS_F, _OBS_D, _OBS_E])]
+    d1 = dataset_digest(identity, _multi_group_frame(groups1))
+    d2 = dataset_digest(identity, _multi_group_frame(groups2))
+    assert d1 == d2
+
+
+def test_multi_group_changed_observation_in_later_group_different_digest():
+    identity = _identity()
+    groups1 = [(_T1, [_OBS_A, _OBS_B]), (_T2, [_OBS_C]), (_T3, [_OBS_D, _OBS_E, _OBS_F])]
+    groups2 = [(_T1, [_OBS_A, _OBS_B]), (_T2, [_OBS_C]), (_T3, [_OBS_D, _OBS_E, _OBS_C])]
+    d1 = dataset_digest(identity, _multi_group_frame(groups1))
+    d2 = dataset_digest(identity, _multi_group_frame(groups2))
+    assert d1 != d2
+
+
+def test_timestamp_groups_are_not_globally_sorted_by_observation_bytes():
+    # T1 carries an observation whose encoded bytes are lexicographically
+    # LARGER than T2's observation. If equal-timestamp ordering were
+    # mistakenly applied dataset-wide instead of within each timestamp group
+    # (mutation M3), a byte-value sort would place T2's group ahead of T1's
+    # -- violating "timestamp remains the primary key". This inspects the
+    # actual byte stream, not just the resulting hash.
+    from marketdata.identity import _TAG_TS, _encode_field
+
+    high_value_obs = (900000.0, 900001.0, 899999.0, 900000.5, 999999)
+    low_value_obs = (1.0, 2.0, 0.5, 1.5, 1)
+    frame = _multi_group_frame([(_T1, [high_value_obs]), (_T2, [low_value_obs])])
+    encoded = _encode_dataset(_identity(), frame)
+
+    t1_ns = int(pd.Timestamp(_T1, tz=IST_NAME).value)
+    t2_ns = int(pd.Timestamp(_T2, tz=IST_NAME).value)
+    t1_field = _encode_field(_TAG_TS, struct.pack(">q", t1_ns))
+    t2_field = _encode_field(_TAG_TS, struct.pack(">q", t2_ns))
+
+    assert encoded.index(t1_field) < encoded.index(t2_field)
+
+
+def test_equal_timestamp_tie_break_uses_encoded_bytes_not_repr():
+    # Adversarial pair where string/repr ordering and canonical-byte ordering
+    # DISAGREE: repr("10.0") < repr("9.0") lexically (string comparison sees
+    # '1' < '9'), but struct.pack(">d", 9.0) < struct.pack(">d", 10.0) as
+    # bytes (IEEE-754 big-endian preserves numeric order for positive
+    # finite floats). A tie-break using repr()/string formatting would
+    # therefore place the 10.0 observation first; the required canonical-
+    # bytes tie-break must place the 9.0 observation first. This is checked
+    # by locating each observation's OPEN field bytes directly in the
+    # encoded stream, not merely by comparing hashes.
+    obs_nine = (9.0, 1.0, 1.0, 1.0, 1)
+    obs_ten = (10.0, 1.0, 1.0, 1.0, 1)
+    frame = _grouped_frame(_T1, [obs_ten, obs_nine])  # arrival order: 10, then 9
+    encoded = _encode_dataset(_identity(), frame)
+
+    open_nine_field = struct.pack(">d", 9.0)
+    open_ten_field = struct.pack(">d", 10.0)
+    assert encoded.index(open_nine_field) < encoded.index(open_ten_field)
+
+
+def test_equal_timestamp_reordering_yields_identical_byte_stream():
+    # Proves byte-stream equality directly, not merely hash equality.
+    identity = _identity()
+    encoded1 = _encode_dataset(identity, _grouped_frame(_T1, [_OBS_A, _OBS_B]))
+    encoded2 = _encode_dataset(identity, _grouped_frame(_T1, [_OBS_B, _OBS_A]))
+    assert encoded1 == encoded2

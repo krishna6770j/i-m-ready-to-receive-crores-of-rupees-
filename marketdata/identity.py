@@ -162,14 +162,51 @@ def _encode_ts_ns(epoch_ns: int) -> bytes:
     return _encode_field(_TAG_TS, struct.pack(">q", epoch_ns))
 
 
+def _encode_observation_values(
+    price_columns: dict[str, "np.ndarray"], volume_series: pd.Series, i: int
+) -> bytes:
+    """Encode one observation's non-timestamp canonical fields (open, high,
+    low, close, volume) using the exact same field encoders as everywhere
+    else in this module.
+
+    This is the single source of truth for "observation bytes": architecture
+    section 8.3 requires that equal-timestamp observations be tie-broken by
+    sorting their own canonical encoded bytes, and those must be the SAME
+    bytes that end up in the digest -- otherwise the sort key and the hashed
+    payload could silently diverge. Returning one concatenated ``bytes``
+    keeps that guarantee structural rather than relying on two call sites
+    staying in sync by convention.
+    """
+    chunks = [_encode_f64(float(price_columns[col][i])) for col in PRICE_COLUMNS]
+    vol = volume_series.iloc[i]
+    if pd.isna(vol):
+        chunks.append(_encode_na())
+    else:
+        chunks.append(_encode_i64(int(vol)))
+    return b"".join(chunks)
+
+
 def _encode_dataset(identity: DatasetIdentity, frame: pd.DataFrame) -> bytes:
     """Build the exact byte stream that ``dataset_digest`` hashes.
 
     Requires ``frame`` to already be canonical (``assert_canonical``) --
     this primitive never sorts, repairs, or otherwise canonicalises its
-    input; that is ``canonicalise()``'s job (marketdata/schemas.py). Row
-    order here is therefore always the frame's own (canonical) order, never
-    silently re-derived.
+    input; that is ``canonicalise()``'s job (marketdata/schemas.py). The
+    frame itself is never mutated or reordered.
+
+    Timestamp remains the primary key (architecture section 8.3): rows are
+    walked in the frame's own ascending-timestamp order, exactly as before.
+    Within one CONTIGUOUS run of rows sharing an identical timestamp --
+    ``assert_canonical`` guarantees timestamps are non-decreasing, so equal
+    timestamps are always contiguous -- source arrival order is provenance,
+    not identity (section 8.3), so those rows are re-ordered for hashing
+    purposes only (the DataFrame itself is untouched) by sorting their own
+    canonical encoded observation bytes lexicographically. Every occurrence
+    is kept: this is a sort, never a deduplication, so ``T:A`` and ``T:A,A``
+    still differ. A timestamp with exactly one row takes the trivial
+    single-element path, which byte-for-byte matches this function's
+    pre-section-8.3 encoding -- ordinary unique-timestamp datasets are
+    therefore unaffected.
     """
     assert_canonical(frame)
 
@@ -190,15 +227,29 @@ def _encode_dataset(identity: DatasetIdentity, frame: pd.DataFrame) -> bytes:
     price_columns = {col: frame[col].to_numpy(dtype="float64") for col in PRICE_COLUMNS}
     volume_series = frame[VOLUME]
 
-    for i in range(row_count):
-        parts.append(_encode_ts_ns(int(ts_ns[i])))
-        for col in PRICE_COLUMNS:
-            parts.append(_encode_f64(float(price_columns[col][i])))
-        vol = volume_series.iloc[i]
-        if pd.isna(vol):
-            parts.append(_encode_na())
+    observation_bytes = [
+        _encode_observation_values(price_columns, volume_series, i)
+        for i in range(row_count)
+    ]
+
+    i = 0
+    while i < row_count:
+        j = i
+        while j + 1 < row_count and ts_ns[j + 1] == ts_ns[i]:
+            j += 1
+        ts_field = _encode_ts_ns(int(ts_ns[i]))
+        if j == i:
+            parts.append(ts_field)
+            parts.append(observation_bytes[i])
         else:
-            parts.append(_encode_i64(int(vol)))
+            # Tie-break ONLY on already-canonical encoded bytes (never
+            # repr()/format()/tuple comparison): Python's default bytes
+            # ordering is exact lexicographic byte comparison, which is
+            # deterministic even where NaN has no total order under `<`.
+            for obs in sorted(observation_bytes[i : j + 1]):
+                parts.append(ts_field)
+                parts.append(obs)
+        i = j + 1
 
     return b"".join(parts)
 
