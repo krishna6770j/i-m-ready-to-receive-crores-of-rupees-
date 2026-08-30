@@ -225,6 +225,19 @@ def test_wrong_pointer_version_rejected():
         CurrentPointer.from_json(json.dumps(payload))
 
 
+@pytest.mark.parametrize("bad_version", [True, False, 1.0, "1", None])
+def test_pointer_version_non_int_rejected(bad_version):
+    # bool is an int subclass in Python (True == 1), so a naive `!= 1`
+    # comparison would silently accept pointer_version=true as version 1.
+    payload = {
+        "pointer_version": bad_version,
+        "generation_id": str(uuid.uuid4()),
+        "integrity_id": "a" * 64,
+    }
+    with pytest.raises(LocatorError):
+        CurrentPointer.from_json(json.dumps(payload))
+
+
 def test_malformed_uuid_rejected():
     with pytest.raises(LocatorError):
         _pointer(generation_id="not-a-uuid")
@@ -259,6 +272,36 @@ def test_extra_path_like_field_rejected_because_unknown():
     }
     with pytest.raises(LocatorError):
         CurrentPointer.from_json(json.dumps(payload))
+
+
+def test_duplicate_pointer_version_key_rejected():
+    gid = uuid.uuid4()
+    text = (
+        '{"pointer_version":1,"pointer_version":1,'
+        f'"generation_id":"{gid}","integrity_id":"{"a"*64}"}}'
+    )
+    with pytest.raises(LocatorError):
+        CurrentPointer.from_json(text)
+
+
+def test_duplicate_generation_id_key_rejected():
+    gid1, gid2 = uuid.uuid4(), uuid.uuid4()
+    text = (
+        f'{{"pointer_version":1,"generation_id":"{gid1}",'
+        f'"generation_id":"{gid2}","integrity_id":"{"a"*64}"}}'
+    )
+    with pytest.raises(LocatorError):
+        CurrentPointer.from_json(text)
+
+
+def test_duplicate_integrity_id_key_rejected():
+    gid = uuid.uuid4()
+    text = (
+        f'{{"pointer_version":1,"generation_id":"{gid}",'
+        f'"integrity_id":"{"a"*64}","integrity_id":"{"b"*64}"}}'
+    )
+    with pytest.raises(LocatorError):
+        CurrentPointer.from_json(text)
 
 
 def test_no_path_string_exists_inside_pointer_structure():

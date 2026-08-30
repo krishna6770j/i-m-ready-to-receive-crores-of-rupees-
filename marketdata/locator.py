@@ -101,6 +101,24 @@ _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _REQUIRED_POINTER_FIELDS = frozenset({"pointer_version", "generation_id", "integrity_id"})
 
 
+def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    """``object_pairs_hook`` for ``json.loads``: raises on any repeated key
+    at any object level, instead of ``dict()``'s default silent
+    last-value-wins behaviour. Applied recursively by ``json.loads`` to
+    every nested object, not only the top level.
+    """
+    seen: set[str] = set()
+    result: dict = {}
+    for key, value in pairs:
+        if key in seen:
+            raise LocatorError(
+                f"CURRENT pointer JSON has a duplicate key: {key!r}"
+            )
+        seen.add(key)
+        result[key] = value
+    return result
+
+
 def _validate_integrity_id(value: object) -> str:
     if not isinstance(value, str) or not _HEX64.match(value):
         raise LocatorError(
@@ -179,12 +197,20 @@ class CurrentPointer:
     @classmethod
     def from_json(cls, text: str) -> "CurrentPointer":
         """Strict parse: malformed JSON, a non-object payload, any unknown
-        field, any missing field, or an unsupported ``pointer_version`` all
-        raise ``LocatorError`` rather than silently accepting or ignoring
-        the problem.
+        field, any missing field, any DUPLICATE field, or an unsupported
+        ``pointer_version`` all raise ``LocatorError`` rather than silently
+        accepting or ignoring the problem.
+
+        Duplicate JSON object keys are rejected explicitly via
+        ``object_pairs_hook``: plain ``json.loads()`` silently keeps only
+        the LAST value for a repeated key (per the JSON spec, which does
+        not forbid duplicates, and per Python's own json module, which
+        does not detect them) -- for a trust pointer, two different values
+        under the same key is corruption or an injection attempt, not a
+        value to silently resolve by picking one.
         """
         try:
-            payload = json.loads(text)
+            payload = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
         except json.JSONDecodeError as exc:
             raise LocatorError(f"CURRENT pointer is not valid JSON: {exc}") from exc
 
@@ -206,10 +232,14 @@ class CurrentPointer:
             )
 
         version = payload["pointer_version"]
-        if version != POINTER_VERSION:
+        # type(...) is int, not isinstance(..., int): bool is an int
+        # subclass in Python (True == 1), so isinstance(True, int) is True
+        # and a plain `!= 1` comparison also accepts True outright. Both
+        # would let pointer_version=true silently pass as version 1.
+        if type(version) is not int or version != POINTER_VERSION:
             raise LocatorError(
                 f"Unsupported pointer_version {version!r}; expected "
-                f"{POINTER_VERSION}"
+                f"{POINTER_VERSION} (as an actual int, not bool/float/str/null)"
             )
 
         return cls(
