@@ -276,6 +276,12 @@ def test_redaction_filter_scrubs_url_query_parameters():
     assert "SECRETCODE123" not in record.msg
 
 
+def _read_log(tmp_path, run_id: str) -> str:
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+    return (tmp_path / f"run_{run_id}.log").read_text()
+
+
 def test_token_does_not_reach_the_log_file(tmp_path, monkeypatch):
     """End-to-end: a secret logged by accident must not land on disk."""
     monkeypatch.setenv("FYERS_ACCESS_TOKEN", "tok_ontheDISK_9876543210")
@@ -283,11 +289,82 @@ def test_token_does_not_reach_the_log_file(tmp_path, monkeypatch):
     logging.getLogger("test").info(
         "token is tok_ontheDISK_9876543210 and should not appear"
     )
-    logging.shutdown()
-
-    contents = (tmp_path / f"run_{run_id}.log").read_text()
+    contents = _read_log(tmp_path, run_id)
     assert "tok_ontheDISK_9876543210" not in contents
     assert REDACTED in contents
+
+
+def test_secret_in_exception_traceback_is_redacted(tmp_path, monkeypatch):
+    """Regression: filters run before the formatter renders exc_info.
+
+    A secret inside an exception message previously reached the log file
+    untouched, because a logging.Filter cannot see record.exc_text.
+    """
+    monkeypatch.setenv("FYERS_ACCESS_TOKEN", "tok_INTRACEBACK_4444555566")
+    run_id = setup_logging(tmp_path, console=False)
+    try:
+        raise ValueError("auth rejected for tok_INTRACEBACK_4444555566")
+    except ValueError:
+        logging.getLogger("test").error("request failed", exc_info=True)
+
+    contents = _read_log(tmp_path, run_id)
+    assert "tok_INTRACEBACK_4444555566" not in contents
+    assert "ValueError" in contents, "the traceback itself must still be logged"
+
+
+def test_secret_in_nested_exception_is_redacted(tmp_path, monkeypatch):
+    """Chained exceptions render both tracebacks; both must be scrubbed."""
+    monkeypatch.setenv("FYERS_ACCESS_TOKEN", "tok_NESTED_7777888899")
+    run_id = setup_logging(tmp_path, console=False)
+    try:
+        try:
+            raise ValueError("inner used tok_NESTED_7777888899")
+        except ValueError as inner:
+            raise RuntimeError("outer wrapper") from inner
+    except RuntimeError:
+        logging.getLogger("test").exception("chained failure")
+
+    contents = _read_log(tmp_path, run_id)
+    assert "tok_NESTED_7777888899" not in contents
+
+
+def test_secret_introduced_after_logging_setup_is_redacted(tmp_path, monkeypatch):
+    """Regression: secrets were snapshotted at filter construction.
+
+    Credentials load via load_dotenv() on first settings access, which
+    routinely happens after logging is configured.
+    """
+    monkeypatch.delenv("FYERS_ACCESS_TOKEN", raising=False)
+    run_id = setup_logging(tmp_path, console=False)
+    monkeypatch.setenv("FYERS_ACCESS_TOKEN", "tok_LATELOADED_1111222233")
+    logging.getLogger("test").info("using tok_LATELOADED_1111222233")
+
+    contents = _read_log(tmp_path, run_id)
+    assert "tok_LATELOADED_1111222233" not in contents
+    assert REDACTED in contents
+
+
+def test_late_secret_in_traceback_is_redacted(tmp_path, monkeypatch):
+    """Combined failure mode: late-loaded credential inside a traceback."""
+    monkeypatch.delenv("FYERS_SECRET_KEY", raising=False)
+    run_id = setup_logging(tmp_path, console=False)
+    monkeypatch.setenv("FYERS_SECRET_KEY", "sec_LATE_AND_NESTED_999888")
+    try:
+        raise ConnectionError("handshake used sec_LATE_AND_NESTED_999888")
+    except ConnectionError:
+        logging.getLogger("test").exception("connection failed")
+
+    contents = _read_log(tmp_path, run_id)
+    assert "sec_LATE_AND_NESTED_999888" not in contents
+
+
+def test_secret_passed_as_log_arg_is_redacted(tmp_path, monkeypatch):
+    monkeypatch.setenv("FYERS_ACCESS_TOKEN", "tok_ASARG_5555666677")
+    run_id = setup_logging(tmp_path, console=False)
+    logging.getLogger("test").info("token=%s", "tok_ASARG_5555666677")
+
+    contents = _read_log(tmp_path, run_id)
+    assert "tok_ASARG_5555666677" not in contents
 
 
 # --- read-only client guard ----------------------------------------------

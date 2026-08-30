@@ -87,6 +87,26 @@ def ohlcv() -> pd.DataFrame:
     return make_ohlcv()
 
 
+@pytest.fixture(autouse=True)
+def _close_log_handlers():
+    """Close root log handlers after each test.
+
+    Tests that call setup_logging() attach a FileHandler to the root logger.
+    Leaving it open leaks a descriptor into the next test and raises
+    ResourceWarning, which pytest.ini escalates to an error.
+    """
+    yield
+    import logging
+
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        root.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 @pytest.fixture
 def tmp_store(tmp_path: Path) -> Path:
     d = tmp_path / "data_store"
