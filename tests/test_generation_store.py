@@ -15,6 +15,7 @@ import pytest
 import marketdata.generation_store as generation_store
 from core.timeutils import IST_NAME
 from marketdata.dataset import MarketDataValidity, ValidatedDataset, ValidationPolicy
+from marketdata.evidence import ChunkResultSnapshot, FetchReportSnapshot
 from marketdata.generation_store import (
     GenerationAlreadyExistsError,
     GenerationConsistencyError,
@@ -24,7 +25,7 @@ from marketdata.generation_store import (
 from marketdata.identity import DatasetIdentity
 from marketdata.locator import CurrentPointer, safe_slug
 from marketdata.provenance import Namespace, ProvenanceEnvelope
-from marketdata.schemas import CLOSE, HIGH, LOW, OPEN, TS, VOLUME
+from marketdata.schemas import CLOSE, HIGH, LOW, OPEN, TS, VOLUME, empty_ohlcv
 
 
 def _identity(**overrides) -> DatasetIdentity:
@@ -87,6 +88,30 @@ def _dataset_dir_for(root: Path, envelope: ProvenanceEnvelope) -> Path:
     )
 
 
+def _fetch_for(ds: ValidatedDataset, *, requested_date: str = "2026-01-01") -> FetchReportSnapshot:
+    """A coherent, cross-check-passing FetchReportSnapshot for one dataset
+    whose candles all fall on a single calendar date (every dataset built
+    from ``_dataset()``/``_invalid_dataset()`` in this file does) --
+    REQUESTS_SUCCEEDED, so a TRUSTED write is permitted by Unit 9's
+    acquisition gate.
+    """
+    frame = ds.frame
+    first_ts = frame[TS].iloc[0].isoformat() if len(frame) else None
+    last_ts = frame[TS].iloc[-1].isoformat() if len(frame) else None
+    return FetchReportSnapshot(
+        symbol=ds.identity.symbol,
+        resolution=ds.identity.resolution,
+        requested_from=requested_date,
+        requested_to=requested_date,
+        chunks=(ChunkResultSnapshot(requested_date, requested_date, len(frame), True, None),),
+        total_rows=len(frame),
+        first_ts=first_ts,
+        last_ts=last_ts,
+        duplicate_rows_removed=0,
+        conflicting_timestamps=0,
+    )
+
+
 # ---------------------------------------------------------------------------
 # basic trusted/forced behaviour
 # ---------------------------------------------------------------------------
@@ -94,7 +119,7 @@ def _dataset_dir_for(root: Path, envelope: ProvenanceEnvelope) -> Path:
 
 def test_first_trusted_write_creates_complete_generation_and_current(tmp_path):
     ds = _dataset()
-    env = ProvenanceEnvelope.build(ds)
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_for(ds))
     result = write_generation(ds, env, tmp_path)
 
     assert result.namespace is Namespace.TRUSTED
@@ -112,11 +137,11 @@ def test_first_trusted_write_creates_complete_generation_and_current(tmp_path):
 def test_second_trusted_write_advances_current_only_after_full_generation_exists(tmp_path):
     identity_kwargs = {}
     ds1 = _dataset(base=100.0, **identity_kwargs)
-    env1 = ProvenanceEnvelope.build(ds1)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_for(ds1))
     result1 = write_generation(ds1, env1, tmp_path)
 
     ds2 = _dataset(base=200.0, **identity_kwargs)
-    env2 = ProvenanceEnvelope.build(ds2)
+    env2 = ProvenanceEnvelope.build(ds2, fetch=_fetch_for(ds2))
     result2 = write_generation(ds2, env2, tmp_path)
 
     current_path = _current_path(result1)
@@ -131,7 +156,7 @@ def test_second_trusted_write_advances_current_only_after_full_generation_exists
 
 def test_forced_write_creates_forced_generation_and_leaves_current_unchanged(tmp_path):
     ds1 = _dataset(base=100.0)
-    env1 = ProvenanceEnvelope.build(ds1)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_for(ds1))
     result1 = write_generation(ds1, env1, tmp_path)
     current_path = _current_path(result1)
     before = current_path.read_text()
@@ -156,7 +181,7 @@ def test_forced_generation_can_never_become_current_even_as_first_write(tmp_path
 
 def test_current_points_to_trusted_namespace_only(tmp_path):
     ds = _dataset()
-    env = ProvenanceEnvelope.build(ds)
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_for(ds))
     result = write_generation(ds, env, tmp_path)
     assert "trusted_generations" in str(result.generation_dir)
     assert "forced_generations" not in str(result.generation_dir)
@@ -212,7 +237,7 @@ def test_fake_dataset_rejected():
 
 def test_raw_dangerous_identifiers_stay_inside_safe_slug_paths(tmp_path):
     ds = _dataset(source="../../etc", symbol="../passwd", resolution="../1")
-    env = ProvenanceEnvelope.build(ds)
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_for(ds))
     result = write_generation(ds, env, tmp_path)
 
     resolved = result.generation_dir.resolve()
@@ -227,7 +252,7 @@ def test_raw_dangerous_identifiers_stay_inside_safe_slug_paths(tmp_path):
 
 def test_existing_generation_never_overwritten(tmp_path):
     ds = _dataset()
-    env = ProvenanceEnvelope.build(ds)
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_for(ds))
     result = write_generation(ds, env, tmp_path)
 
     original_manifest = (result.generation_dir / "manifest.json").read_text()
@@ -245,7 +270,7 @@ def test_existing_generation_never_overwritten(tmp_path):
 
 def test_manifest_and_data_both_present_before_current_written(tmp_path):
     ds = _dataset()
-    env = ProvenanceEnvelope.build(ds)
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_for(ds))
     result = write_generation(ds, env, tmp_path)
     assert (result.generation_dir / "data.parquet").exists()
     assert (result.generation_dir / "manifest.json").exists()
@@ -293,7 +318,7 @@ def test_write_sequence_order_matches_architecture(tmp_path, monkeypatch):
     monkeypatch.setattr(generation_store, "_atomic_replace", replace)
 
     ds = _dataset()
-    env = ProvenanceEnvelope.build(ds)
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_for(ds))
     result = write_generation(ds, env, tmp_path)
 
     gid = str(env.generation_id)
@@ -346,7 +371,7 @@ def test_forced_write_sequence_has_no_current_steps(tmp_path, monkeypatch):
 
 def test_failed_parquet_write_leaves_current_unchanged(tmp_path, monkeypatch):
     ds0 = _dataset(base=100.0)
-    env0 = ProvenanceEnvelope.build(ds0)
+    env0 = ProvenanceEnvelope.build(ds0, fetch=_fetch_for(ds0))
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
 
@@ -356,7 +381,7 @@ def test_failed_parquet_write_leaves_current_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(generation_store, "_write_data_parquet", boom)
 
     ds1 = _dataset(base=200.0)
-    env1 = ProvenanceEnvelope.build(ds1)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_for(ds1))
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
 
@@ -369,7 +394,7 @@ def test_failed_parquet_write_leaves_current_unchanged(tmp_path, monkeypatch):
 
 def test_failed_manifest_write_leaves_current_unchanged(tmp_path, monkeypatch):
     ds0 = _dataset(base=100.0)
-    env0 = ProvenanceEnvelope.build(ds0)
+    env0 = ProvenanceEnvelope.build(ds0, fetch=_fetch_for(ds0))
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
 
@@ -383,7 +408,7 @@ def test_failed_manifest_write_leaves_current_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(generation_store, "_write_text", selective_boom)
 
     ds1 = _dataset(base=200.0)
-    env1 = ProvenanceEnvelope.build(ds1)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_for(ds1))
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
 
@@ -395,7 +420,7 @@ def test_failed_manifest_write_leaves_current_unchanged(tmp_path, monkeypatch):
 
 def test_failed_current_tmp_write_leaves_current_unchanged(tmp_path, monkeypatch):
     ds0 = _dataset(base=100.0)
-    env0 = ProvenanceEnvelope.build(ds0)
+    env0 = ProvenanceEnvelope.build(ds0, fetch=_fetch_for(ds0))
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
 
@@ -409,7 +434,7 @@ def test_failed_current_tmp_write_leaves_current_unchanged(tmp_path, monkeypatch
     monkeypatch.setattr(generation_store, "_write_text", selective_boom)
 
     ds1 = _dataset(base=200.0)
-    env1 = ProvenanceEnvelope.build(ds1)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_for(ds1))
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
 
@@ -423,7 +448,7 @@ def test_failed_current_tmp_write_leaves_current_unchanged(tmp_path, monkeypatch
 
 def test_failed_os_replace_leaves_current_unchanged(tmp_path, monkeypatch):
     ds0 = _dataset(base=100.0)
-    env0 = ProvenanceEnvelope.build(ds0)
+    env0 = ProvenanceEnvelope.build(ds0, fetch=_fetch_for(ds0))
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
 
@@ -433,7 +458,7 @@ def test_failed_os_replace_leaves_current_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(generation_store, "_atomic_replace", boom)
 
     ds1 = _dataset(base=200.0)
-    env1 = ProvenanceEnvelope.build(ds1)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_for(ds1))
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
 
@@ -442,7 +467,7 @@ def test_failed_os_replace_leaves_current_unchanged(tmp_path, monkeypatch):
 
 def test_orphan_generation_is_inert(tmp_path, monkeypatch):
     ds0 = _dataset(base=100.0)
-    env0 = ProvenanceEnvelope.build(ds0)
+    env0 = ProvenanceEnvelope.build(ds0, fetch=_fetch_for(ds0))
     result0 = write_generation(ds0, env0, tmp_path)
 
     def boom(tmp, target):
@@ -451,7 +476,7 @@ def test_orphan_generation_is_inert(tmp_path, monkeypatch):
     monkeypatch.setattr(generation_store, "_atomic_replace", boom)
 
     ds1 = _dataset(base=200.0)
-    env1 = ProvenanceEnvelope.build(ds1)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_for(ds1))
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
 
@@ -468,7 +493,7 @@ def test_orphan_generation_is_inert(tmp_path, monkeypatch):
 
 def test_previous_trusted_generation_remains_intact_after_failed_new_write(tmp_path, monkeypatch):
     ds0 = _dataset(base=100.0)
-    env0 = ProvenanceEnvelope.build(ds0)
+    env0 = ProvenanceEnvelope.build(ds0, fetch=_fetch_for(ds0))
     result0 = write_generation(ds0, env0, tmp_path)
     original_data = (result0.generation_dir / "data.parquet").read_bytes()
     original_manifest = (result0.generation_dir / "manifest.json").read_text()
@@ -479,7 +504,7 @@ def test_previous_trusted_generation_remains_intact_after_failed_new_write(tmp_p
     monkeypatch.setattr(generation_store, "_write_data_parquet", boom)
 
     ds1 = _dataset(base=200.0)
-    env1 = ProvenanceEnvelope.build(ds1)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_for(ds1))
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
 
@@ -496,7 +521,7 @@ def test_previous_trusted_generation_remains_intact_after_failed_new_write(tmp_p
 
 def test_missing_hierarchy_created_component_by_component(tmp_path):
     ds = _dataset()
-    env = ProvenanceEnvelope.build(ds)
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_for(ds))
     write_generation(ds, env, tmp_path)
 
     source_dir = tmp_path / safe_slug(env.source)
@@ -519,7 +544,7 @@ def test_parent_fsync_follows_each_newly_created_hierarchy_component(tmp_path, m
     monkeypatch.setattr(generation_store, "_fsync_dir", fsync_dir)
 
     ds = _dataset()
-    env = ProvenanceEnvelope.build(ds)
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_for(ds))
     write_generation(ds, env, tmp_path)
 
     source_slug = safe_slug(env.source)
@@ -533,7 +558,7 @@ def test_parent_fsync_follows_each_newly_created_hierarchy_component(tmp_path, m
 
 def test_existing_hierarchy_does_not_require_recreation(tmp_path, monkeypatch):
     ds0 = _dataset(base=100.0)
-    env0 = ProvenanceEnvelope.build(ds0)
+    env0 = ProvenanceEnvelope.build(ds0, fetch=_fetch_for(ds0))
     write_generation(ds0, env0, tmp_path)
 
     fsynced_dirs: list[str] = []
@@ -546,7 +571,7 @@ def test_existing_hierarchy_does_not_require_recreation(tmp_path, monkeypatch):
     monkeypatch.setattr(generation_store, "_fsync_dir", fsync_dir)
 
     ds1 = _dataset(base=200.0)  # same identity -> hierarchy already exists
-    env1 = ProvenanceEnvelope.build(ds1)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_for(ds1))
     write_generation(ds1, env1, tmp_path)
 
     source_slug = safe_slug(env1.source)
@@ -589,7 +614,7 @@ def test_forced_first_write_gets_same_durable_hierarchy_treatment(tmp_path, monk
 def test_missing_root_raises_clear_error_without_implicit_creation(tmp_path):
     missing_root = tmp_path / "does_not_exist_yet"
     ds = _dataset()
-    env = ProvenanceEnvelope.build(ds)
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_for(ds))
 
     with pytest.raises(generation_store.GenerationStoreError):
         write_generation(ds, env, missing_root)
@@ -601,7 +626,7 @@ def test_root_is_a_file_raises_clear_error(tmp_path):
     file_root = tmp_path / "not_a_directory"
     file_root.write_text("surprise")
     ds = _dataset()
-    env = ProvenanceEnvelope.build(ds)
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_for(ds))
 
     with pytest.raises(generation_store.GenerationStoreError):
         write_generation(ds, env, file_root)
@@ -619,7 +644,7 @@ def test_hierarchy_parent_fsync_failure_leaves_no_current(tmp_path, monkeypatch)
     monkeypatch.setattr(generation_store, "_fsync_dir", boom)
 
     ds = _dataset()
-    env = ProvenanceEnvelope.build(ds)
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_for(ds))
     with pytest.raises(OSError):
         write_generation(ds, env, tmp_path)
 
@@ -629,7 +654,7 @@ def test_hierarchy_parent_fsync_failure_leaves_no_current(tmp_path, monkeypatch)
 
 def test_data_file_fsync_failure_leaves_previous_current_unchanged(tmp_path, monkeypatch):
     ds0 = _dataset(base=100.0)
-    env0 = ProvenanceEnvelope.build(ds0)
+    env0 = ProvenanceEnvelope.build(ds0, fetch=_fetch_for(ds0))
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
 
@@ -643,7 +668,7 @@ def test_data_file_fsync_failure_leaves_previous_current_unchanged(tmp_path, mon
     monkeypatch.setattr(generation_store, "_fsync_file", selective_boom)
 
     ds1 = _dataset(base=200.0)
-    env1 = ProvenanceEnvelope.build(ds1)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_for(ds1))
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
 
@@ -652,7 +677,7 @@ def test_data_file_fsync_failure_leaves_previous_current_unchanged(tmp_path, mon
 
 def test_manifest_fsync_failure_leaves_previous_current_unchanged(tmp_path, monkeypatch):
     ds0 = _dataset(base=100.0)
-    env0 = ProvenanceEnvelope.build(ds0)
+    env0 = ProvenanceEnvelope.build(ds0, fetch=_fetch_for(ds0))
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
 
@@ -666,7 +691,7 @@ def test_manifest_fsync_failure_leaves_previous_current_unchanged(tmp_path, monk
     monkeypatch.setattr(generation_store, "_fsync_file", selective_boom)
 
     ds1 = _dataset(base=200.0)
-    env1 = ProvenanceEnvelope.build(ds1)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_for(ds1))
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
 
@@ -675,7 +700,7 @@ def test_manifest_fsync_failure_leaves_previous_current_unchanged(tmp_path, monk
 
 def test_generation_dir_fsync_failure_leaves_previous_current_unchanged(tmp_path, monkeypatch):
     ds0 = _dataset(base=100.0)
-    env0 = ProvenanceEnvelope.build(ds0)
+    env0 = ProvenanceEnvelope.build(ds0, fetch=_fetch_for(ds0))
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
 
@@ -687,7 +712,7 @@ def test_generation_dir_fsync_failure_leaves_previous_current_unchanged(tmp_path
         return orig_fsync_dir(path)
 
     ds1 = _dataset(base=200.0)
-    env1 = ProvenanceEnvelope.build(ds1)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_for(ds1))
     monkeypatch.setattr(generation_store, "_fsync_dir", selective_boom)
 
     with pytest.raises(OSError):
@@ -698,7 +723,7 @@ def test_generation_dir_fsync_failure_leaves_previous_current_unchanged(tmp_path
 
 def test_namespace_dir_fsync_failure_leaves_previous_current_unchanged(tmp_path, monkeypatch):
     ds0 = _dataset(base=100.0)
-    env0 = ProvenanceEnvelope.build(ds0)
+    env0 = ProvenanceEnvelope.build(ds0, fetch=_fetch_for(ds0))
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
 
@@ -713,7 +738,7 @@ def test_namespace_dir_fsync_failure_leaves_previous_current_unchanged(tmp_path,
     monkeypatch.setattr(generation_store, "_fsync_dir", selective_boom)
 
     ds1 = _dataset(base=200.0)
-    env1 = ProvenanceEnvelope.build(ds1)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_for(ds1))
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
 
@@ -746,7 +771,7 @@ def test_invalid_trusted_rejection_happens_before_any_filesystem_mutation(tmp_pa
 
 def test_existing_current_byte_identical_after_rejected_invalid_trusted_write(tmp_path):
     ds_valid = _dataset()
-    env_valid = ProvenanceEnvelope.build(ds_valid)
+    env_valid = ProvenanceEnvelope.build(ds_valid, fetch=_fetch_for(ds_valid))
     result_valid = write_generation(ds_valid, env_valid, tmp_path)
     current_before = _current_path(result_valid).read_text()
 
@@ -771,7 +796,7 @@ def test_invalid_dataset_with_explicit_forced_envelope_persisted_under_forced(tm
 
 def test_forced_invalid_write_never_changes_current(tmp_path):
     ds_valid = _dataset()
-    env_valid = ProvenanceEnvelope.build(ds_valid)
+    env_valid = ProvenanceEnvelope.build(ds_valid, fetch=_fetch_for(ds_valid))
     result_valid = write_generation(ds_valid, env_valid, tmp_path)
     current_before = _current_path(result_valid).read_text()
 
@@ -786,7 +811,7 @@ def test_forced_invalid_write_never_changes_current(tmp_path):
 def test_valid_trusted_dataset_still_writes_normally(tmp_path):
     ds = _dataset()
     assert ds.market_data_validity is MarketDataValidity.VALID
-    env = ProvenanceEnvelope.build(ds)
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_for(ds))
     result = write_generation(ds, env, tmp_path)
     assert result.namespace is Namespace.TRUSTED
     assert result.current_updated is True
@@ -814,7 +839,24 @@ def test_validation_policy_causing_invalid_also_triggers_the_gate(tmp_path):
     assert ds_lenient.market_data_validity is MarketDataValidity.VALID
     assert ds_strict.market_data_validity is MarketDataValidity.INVALID
 
-    env_lenient = ProvenanceEnvelope.build(ds_lenient, generation_id=uuid.uuid4())
+    # This dataset spans two calendar dates (Jan 1 and Jan 11), so the
+    # generic single-day _fetch_for() helper does not apply -- build a
+    # matching two-chunk fetch covering the full requested span.
+    fetch_lenient = FetchReportSnapshot(
+        symbol="NIFTY", resolution="1",
+        requested_from="2026-01-01", requested_to="2026-01-11",
+        chunks=(
+            ChunkResultSnapshot("2026-01-01", "2026-01-10", 2, True, None),
+            ChunkResultSnapshot("2026-01-11", "2026-01-11", 1, True, None),
+        ),
+        total_rows=3,
+        first_ts=ds_lenient.frame[TS].iloc[0].isoformat(),
+        last_ts=ds_lenient.frame[TS].iloc[-1].isoformat(),
+        duplicate_rows_removed=0, conflicting_timestamps=0,
+    )
+    env_lenient = ProvenanceEnvelope.build(
+        ds_lenient, fetch=fetch_lenient, generation_id=uuid.uuid4()
+    )
     # lenient writes fine
     write_generation(ds_lenient, env_lenient, tmp_path)
 
@@ -826,7 +868,7 @@ def test_validation_policy_causing_invalid_also_triggers_the_gate(tmp_path):
 def test_adversarial_valid_then_invalid_trusted_attempt_leaves_current_and_disk_untouched(tmp_path):
     # 1. write valid trusted generation A
     ds_a = _dataset(base=100.0)
-    env_a = ProvenanceEnvelope.build(ds_a)
+    env_a = ProvenanceEnvelope.build(ds_a, fetch=_fetch_for(ds_a))
     result_a = write_generation(ds_a, env_a, tmp_path)
     current_before = _current_path(result_a).read_text()
 
@@ -846,3 +888,121 @@ def test_adversarial_valid_then_invalid_trusted_attempt_leaves_current_and_disk_
     b_generation_dir = trusted_dir / str(env_b.generation_id)
     assert not b_generation_dir.exists()
     assert set(trusted_dir.iterdir()) == generations_before
+
+
+# ---------------------------------------------------------------------------
+# Unit 9: acquisition-status trust gate
+# ---------------------------------------------------------------------------
+
+
+def _fetch_with_status(ds: ValidatedDataset, status: str, *, requested_date: str = "2026-01-01") -> FetchReportSnapshot:
+    frame = ds.frame
+    first_ts = frame[TS].iloc[0].isoformat() if len(frame) else None
+    last_ts = frame[TS].iloc[-1].isoformat() if len(frame) else None
+    if status == "FAILED":
+        return FetchReportSnapshot(
+            symbol=ds.identity.symbol, resolution=ds.identity.resolution,
+            requested_from=requested_date, requested_to=requested_date,
+            chunks=(ChunkResultSnapshot(requested_date, requested_date, 0, False, "boom"),),
+            total_rows=0, first_ts=None, last_ts=None,
+            duplicate_rows_removed=0, conflicting_timestamps=0,
+        )
+    if status == "EMPTY":
+        return FetchReportSnapshot(
+            symbol=ds.identity.symbol, resolution=ds.identity.resolution,
+            requested_from=requested_date, requested_to=requested_date,
+            chunks=(ChunkResultSnapshot(requested_date, requested_date, 0, True, None),),
+            total_rows=0, first_ts=None, last_ts=None,
+            duplicate_rows_removed=0, conflicting_timestamps=0,
+        )
+    if status == "PARTIAL":
+        # Two-day request: one ok chunk (matching this dataset's actual
+        # rows), one failed chunk -- overall PARTIAL.
+        return FetchReportSnapshot(
+            symbol=ds.identity.symbol, resolution=ds.identity.resolution,
+            requested_from=requested_date, requested_to="2026-01-02",
+            chunks=(
+                ChunkResultSnapshot(requested_date, requested_date, len(frame), True, None),
+                ChunkResultSnapshot("2026-01-02", "2026-01-02", 0, False, "rate limited"),
+            ),
+            total_rows=len(frame), first_ts=first_ts, last_ts=last_ts,
+            duplicate_rows_removed=0, conflicting_timestamps=0,
+        )
+    raise ValueError(status)
+
+
+def test_only_succeeded_status_may_update_current(tmp_path):
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_for(ds))
+    result = write_generation(ds, env, tmp_path)
+    assert result.current_updated is True
+
+
+def test_unknown_status_trusted_write_rejected_before_filesystem_mutation(tmp_path):
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds, forced=False)  # fetch=None -> UNKNOWN
+    with pytest.raises(GenerationConsistencyError):
+        write_generation(ds, env, tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_failed_status_trusted_write_rejected_before_filesystem_mutation(tmp_path):
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_with_status(ds, "FAILED"))
+    with pytest.raises(GenerationConsistencyError):
+        write_generation(ds, env, tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_empty_status_trusted_write_rejected_before_filesystem_mutation(tmp_path):
+    ds = ValidatedDataset.build(empty_ohlcv(), identity=_identity())
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_with_status(ds, "EMPTY"))
+    with pytest.raises(GenerationConsistencyError):
+        write_generation(ds, env, tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_partial_status_trusted_write_rejected_before_filesystem_mutation(tmp_path):
+    ds = _dataset()
+    env = ProvenanceEnvelope.build(ds, fetch=_fetch_with_status(ds, "PARTIAL"))
+    with pytest.raises(GenerationConsistencyError):
+        write_generation(ds, env, tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_all_four_non_succeeded_statuses_persistable_through_forced_storage(tmp_path):
+    for status in ("FAILED", "EMPTY", "PARTIAL"):
+        # FAILED/EMPTY both correspond to zero actual rows (no chunk
+        # contributed data); PARTIAL's one successful chunk must match a
+        # real, non-empty dataset.
+        ds = (
+            _dataset(base=100.0 + hash(status) % 50)
+            if status == "PARTIAL"
+            else ValidatedDataset.build(empty_ohlcv(), identity=_identity())
+        )
+        fetch = _fetch_with_status(ds, status)
+        env = ProvenanceEnvelope.build(ds, fetch=fetch, forced=True, force_reason=f"forensic {status}")
+        result = write_generation(ds, env, tmp_path)
+        assert result.namespace is Namespace.FORCED
+        assert result.current_updated is False
+
+    # UNKNOWN (fetch=None) forced write.
+    ds_unknown = _dataset(base=999.0)
+    env_unknown = ProvenanceEnvelope.build(ds_unknown, forced=True, force_reason="forensic UNKNOWN")
+    result_unknown = write_generation(ds_unknown, env_unknown, tmp_path)
+    assert result_unknown.namespace is Namespace.FORCED
+    assert result_unknown.current_updated is False
+
+
+def test_previous_current_unchanged_after_rejected_acquisition_status(tmp_path):
+    ds0 = _dataset(base=100.0)
+    env0 = ProvenanceEnvelope.build(ds0, fetch=_fetch_for(ds0))
+    result0 = write_generation(ds0, env0, tmp_path)
+    current_before = _current_path(result0).read_text()
+
+    ds1 = _dataset(base=200.0)
+    env1 = ProvenanceEnvelope.build(ds1, fetch=_fetch_with_status(ds1, "FAILED"))
+    with pytest.raises(GenerationConsistencyError):
+        write_generation(ds1, env1, tmp_path)
+
+    assert _current_path(result0).read_text() == current_before

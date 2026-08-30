@@ -84,6 +84,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from marketdata.acquisition import (
+    AcquisitionError,
+    AcquisitionRequestStatus,
+    classify_acquisition_status,
+    cross_check_fetch_against_dataset,
+    validate_fetch_evidence,
+)
 from marketdata.dataset import MarketDataValidity, ValidatedDataset
 from marketdata.locator import CurrentPointer, safe_slug
 from marketdata.provenance import Namespace, ProvenanceEnvelope
@@ -210,6 +217,29 @@ def _verify_consistency(dataset: ValidatedDataset, envelope: ProvenanceEnvelope)
             "(ProvenanceEnvelope.build(dataset, forced=True, "
             "force_reason=<non-empty>)) -- this is never silently converted "
             "here; the operator must choose force explicitly."
+        )
+
+    if envelope.fetch is not None:
+        try:
+            validate_fetch_evidence(envelope.fetch)
+            cross_check_fetch_against_dataset(envelope.fetch, dataset)
+        except AcquisitionError as exc:
+            raise GenerationConsistencyError(str(exc)) from exc
+
+    acquisition_status = classify_acquisition_status(envelope.fetch)
+    if (
+        envelope.namespace is Namespace.TRUSTED
+        and acquisition_status is not AcquisitionRequestStatus.REQUESTS_SUCCEEDED
+    ):
+        raise GenerationConsistencyError(
+            f"Refusing to write: acquisition status is "
+            f"{acquisition_status.value}, but envelope.namespace is TRUSTED. "
+            "A TRUSTED write requires AcquisitionRequestStatus == "
+            "REQUESTS_SUCCEEDED (frozen architecture section 11) -- "
+            "REQUESTS_SUCCEEDED says only that every broker request "
+            "returned without error, nothing about coverage/continuity/"
+            "sessions/density. Evidence with any other status may only be "
+            "persisted via an explicit FORCED envelope."
         )
 
 
