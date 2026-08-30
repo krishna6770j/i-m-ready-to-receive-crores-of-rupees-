@@ -22,8 +22,10 @@ on:
     branches:
       - main
 
-# Read-only. This workflow never commits, pushes, uploads data, creates
-# releases, or modifies any branch.
+# Credentials: no user-provided secrets, broker credentials, PATs or repository
+# secrets are required or referenced. GitHub supplies an ephemeral GITHUB_TOKEN
+# to every Actions job; it is scoped read-only by the block below and is NOT
+# persisted into the checkout's git config (see persist-credentials).
 permissions:
   contents: read
 
@@ -43,10 +45,26 @@ jobs:
           # prove .env was never committed in ANY revision. A shallow clone
           # would let that assertion pass without examining real history.
           fetch-depth: 0
+          # Default is true, which writes the ephemeral GITHUB_TOKEN into the
+          # checkout's local git config. This job only reads; it never pushes,
+          # so the credential must not outlive the fetch.
+          persist-credentials: false
 
       - name: Install uv
         # astral-sh/setup-uv v10.0.1
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          # Pinned. Without this the action reports "Could not determine uv
+          # version ... Falling back to latest", so re-running this same commit
+          # later could install a different uv binary. Run 33295876076 happened
+          # to get 0.12.7; that must be the fixed baseline, not an accident.
+          version: "0.12.7"
+          # Default is "auto", which enabled caching and saved ~99 MB in run
+          # 33295876076. A mutable cache is another variable in a trust
+          # baseline, and its key referenced the runner's Python 3.12.3 rather
+          # than the 3.12.14 actually under test. The job takes ~18s, so there
+          # is no measured build-time problem to solve.
+          enable-cache: false
 
       - name: Install Python 3.12.14
         # Pinned to the exact patch release requirements.txt was resolved on.
