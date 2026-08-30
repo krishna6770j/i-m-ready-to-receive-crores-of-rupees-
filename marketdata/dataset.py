@@ -7,12 +7,18 @@ checking they correspond -- an invalid frame plus an unrelated valid frame's
 report can be persisted as ``validation_status="valid"``.
 
 Core invariant this module enforces structurally, not by convention: **a
-validation report can never be supplied separately from the frame it claims
-to validate.** ``ValidatedDataset.build()`` is the only way to construct one,
-it runs ``validate()`` internally on the exact frame it ends up holding, and
-there is no parameter through which a caller could substitute a
-pre-built ``ValidationReport``, an arbitrary digest, or a different
-``MARKET_DATA_SCHEMA_VERSION``.
+validation report -- and, per manager review of an earlier revision,
+canonicalisation evidence too -- can never be supplied separately from the
+frame it claims to describe.** ``ValidatedDataset.build()`` is the only way
+to construct one. It takes a RAW ``pd.DataFrame`` and calls ``canonicalise()``
+on it INTERNALLY: an earlier revision of this module accepted a caller-
+supplied ``CanonicalisationResult``, which let a caller bind one frame's
+data to a completely different frame's transformations/anomalies/source
+evidence (reproduced directly: a 3-row frame bound to evidence claiming 7
+rows and a ``TIMEZONE_CONVERTED`` transformation that never happened to it).
+Canonicalising internally makes that forgery structurally impossible, the
+same way accepting no ``report``/``digest``/``schema_version`` parameter
+makes THOSE substitutions impossible.
 
 **Validated, possibly invalid.** Building a ``ValidatedDataset`` for OHLC-
 invalid data (bad ordering, non-positive prices, ...) is ALLOWED: those are
@@ -43,10 +49,28 @@ returns a FRESH deep copy on every access, so mutating what a caller
 previously received back never reaches the bound internal frame -- tamper-
 EVIDENCE, not tamper-prevention, "the strongest guarantee available in this
 language" (section 16).
+
+**Validation policy is bound evidence, not a build-time secret.** ``build()``
+previously accepted ``expected_interval_minutes``/``sigma_threshold``/
+``session_window``/``max_session_gap_days`` but discarded them once
+``validate()`` returned -- a caller inspecting a built ``ValidatedDataset``
+had no way to know which policy actually produced its validation evidence.
+``ValidationPolicy`` is a frozen value object bundling exactly those four
+fields; ``build()`` stores the exact policy instance it validated against
+and exposes it as ``.validation_policy``, and validation always runs from
+that stored policy, never from ad-hoc defaults recomputed elsewhere. The
+policy is deliberately NOT part of ``data_digest``: the frozen architecture's
+identity (section 8.1) is the canonical observation sequence plus
+schema_version/source/symbol/resolution -- a validation policy is a
+provenance/evidence fact about HOW the data was checked, not a fact about
+WHAT the data is. The same frame + identity validated under two different
+policies (e.g. differing ``max_session_gap_days``) can therefore legitimately
+share one ``data_digest`` while producing different validation evidence.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 
 import pandas as pd
@@ -56,10 +80,10 @@ from marketdata.identity import DatasetIdentity, dataset_digest
 from marketdata.schemas import (
     AnomalySeverity,
     CanonicalisationAnomaly,
-    CanonicalisationResult,
     CanonicalisationTransformation,
     SourceEvidence,
     assert_canonical,
+    canonicalise,
 )
 from marketdata.validator import validate
 
@@ -86,6 +110,24 @@ class MarketDataValidity(str, Enum):
     INVALID = "INVALID"
 
 
+@dataclass(frozen=True, slots=True)
+class ValidationPolicy:
+    """Exactly the configuration ``marketdata.validator.validate()`` accepts,
+    bundled so it can be bound to a ``ValidatedDataset`` and inspected later
+    instead of being silently discarded once ``validate()`` returns.
+
+    NOT part of ``data_digest``: this describes HOW data was checked, not
+    WHAT the data is (see the module docstring). Two builds of the same
+    frame + identity under different policies may share one digest while
+    differing in validation evidence.
+    """
+
+    expected_interval_minutes: int | None = None
+    sigma_threshold: float = 10.0
+    session_window: tuple | None = None
+    max_session_gap_days: float | None = None
+
+
 class ValidatedDataset:
     """A canonical frame permanently bound to its own validation evidence,
     canonicalisation evidence, identity and content digest.
@@ -108,6 +150,7 @@ class ValidatedDataset:
         "_identity",
         "_digest",
         "_validation",
+        "_validation_policy",
         "_transformations",
         "_source_anomalies",
         "_source_evidence",
@@ -117,9 +160,9 @@ class ValidatedDataset:
     def __init__(self, *args, **kwargs) -> None:
         raise TypeError(
             "ValidatedDataset cannot be constructed directly; use "
-            "ValidatedDataset.build(canonicalisation, identity=...) instead, "
-            "so the validation report is always generated from the exact "
-            "frame it describes."
+            "ValidatedDataset.build(raw_frame, identity=...) instead, so "
+            "canonicalisation and the validation report are always "
+            "generated from the exact frame supplied."
         )
 
     def __setattr__(self, name: str, value: object) -> None:
@@ -145,37 +188,41 @@ class ValidatedDataset:
     @classmethod
     def build(
         cls,
-        canonicalisation: CanonicalisationResult,
+        raw_frame: pd.DataFrame,
         *,
         identity: DatasetIdentity,
-        expected_interval_minutes: int | None = None,
-        sigma_threshold: float = 10.0,
-        session_window: tuple | None = None,
-        max_session_gap_days: float | None = None,
+        validation_policy: ValidationPolicy = ValidationPolicy(),
     ) -> "ValidatedDataset":
-        """Build a ``ValidatedDataset`` from canonicalisation evidence.
+        """Build a ``ValidatedDataset`` from a RAW ``pd.DataFrame``.
 
-        ``canonicalisation`` must be the ``CanonicalisationResult`` produced
-        by ``canonicalise()``/``canonicalise_fyers_candles()`` for the exact
-        data this object is meant to describe -- there is deliberately no
-        separate ``frame`` parameter, so a caller cannot pass a
-        ``CanonicalisationResult`` for one frame alongside a different frame:
-        the frame IS ``canonicalisation.frame``.
+        ``canonicalise(raw_frame)`` runs INTERNALLY, here -- there is
+        deliberately no way to supply canonicalisation evidence (a
+        ``CanonicalisationResult``) separately from the frame it describes.
+        An earlier revision of this method accepted one as a parameter,
+        which let a caller bind one frame's data to a different frame's
+        transformations/anomalies/source evidence; canonicalising internally
+        makes that forgery structurally impossible, exactly like accepting
+        no ``report``/``digest``/``schema_version`` parameter does for those.
 
-        Raises ``TrustBlockerError`` if ``canonicalisation.source_anomalies``
-        contains any BLOCKER-severity anomaly (section 14). Raises
-        ``SchemaError`` if ``canonicalisation.frame`` is not canonical
-        (defence in depth against a hand-constructed, counterfeit
-        ``CanonicalisationResult``; a genuine one from ``canonicalise()`` is
-        always canonical).
+        Only a generic ``pd.DataFrame`` is accepted. A FYERS-positional-
+        payload constructor (wrapping ``canonicalise_fyers_candles()``) is
+        explicitly NOT implemented here -- out of scope for this unit.
 
-        ``expected_interval_minutes``/``sigma_threshold``/``session_window``/
-        ``max_session_gap_days`` are forwarded verbatim to ``validate()``;
-        their defaults match ``validate()``'s own. ``symbol``/``resolution``
-        are taken from ``identity``, never accepted separately, so the
-        validation report's own symbol/resolution can never diverge from the
-        identity this object is bound to.
+        Raises ``TrustBlockerError`` if internal canonicalisation reports any
+        BLOCKER-severity anomaly (section 14: "TRUST BLOCKER means
+        ``ValidatedDataset.build()`` fails; nothing reaches storage").
+
+        ``validation_policy`` is a ``ValidationPolicy`` (default: all of
+        ``validate()``'s own defaults). It is stored EXACTLY as given and
+        exposed via ``.validation_policy``; ``validate()`` runs from that
+        stored policy's fields, never from ad-hoc values. ``symbol``/
+        ``resolution`` passed to ``validate()`` are taken from ``identity``,
+        never accepted separately, so the validation report's own symbol/
+        resolution can never diverge from the identity this object is bound
+        to.
         """
+        canonicalisation = canonicalise(raw_frame)
+
         blockers = [
             a for a in canonicalisation.source_anomalies
             if a.severity is AnomalySeverity.BLOCKER
@@ -190,21 +237,21 @@ class ValidatedDataset:
 
         assert_canonical(canonicalisation.frame)
 
-        # Own, independent deep copy: decoupled not only from whatever the
-        # caller's original raw input was (canonicalise() already guarantees
-        # that), but also from canonicalisation.frame itself, so mutating
-        # the CanonicalisationResult the caller still holds after this call
-        # can never reach this object's internal state either.
+        # Own, independent deep copy: decoupled not only from raw_frame
+        # (canonicalise() already guarantees that) but also from
+        # canonicalisation.frame itself, so mutating the raw frame the
+        # caller still holds after this call can never reach this object's
+        # internal state either.
         frame = canonicalisation.frame.copy(deep=True)
 
         report = validate(
             frame,
             symbol=identity.symbol,
             resolution=identity.resolution,
-            expected_interval_minutes=expected_interval_minutes,
-            sigma_threshold=sigma_threshold,
-            session_window=session_window,
-            max_session_gap_days=max_session_gap_days,
+            expected_interval_minutes=validation_policy.expected_interval_minutes,
+            sigma_threshold=validation_policy.sigma_threshold,
+            session_window=validation_policy.session_window,
+            max_session_gap_days=validation_policy.max_session_gap_days,
         )
         validation_snapshot = snapshot_validation_report(report)
 
@@ -214,6 +261,7 @@ class ValidatedDataset:
         object.__setattr__(self, "_identity", identity)
         object.__setattr__(self, "_digest", digest)
         object.__setattr__(self, "_validation", validation_snapshot)
+        object.__setattr__(self, "_validation_policy", validation_policy)
         object.__setattr__(
             self, "_transformations", tuple(canonicalisation.transformations)
         )
@@ -238,6 +286,10 @@ class ValidatedDataset:
     @property
     def validation(self) -> ValidationReportSnapshot:
         return self._validation
+
+    @property
+    def validation_policy(self) -> ValidationPolicy:
+        return self._validation_policy
 
     @property
     def market_data_validity(self) -> MarketDataValidity:

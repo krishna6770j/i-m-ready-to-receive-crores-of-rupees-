@@ -1,9 +1,10 @@
 """ValidatedDataset tests.
 
-Core invariant (frozen architecture defect #1, section 16): a validation
-report can never be supplied separately from the frame it claims to
-validate. ValidatedDataset.build() must generate the report itself, from
-the exact canonical frame it ends up holding.
+Core invariants (frozen architecture defect #1, section 16, and manager
+review of an earlier revision): a validation report -- and canonicalisation
+evidence -- can never be supplied separately from the frame they describe.
+ValidatedDataset.build() must canonicalise and validate internally, from the
+exact raw frame it is given.
 """
 
 from __future__ import annotations
@@ -14,7 +15,12 @@ import pandas as pd
 import pytest
 
 from core.timeutils import IST_NAME
-from marketdata.dataset import MarketDataValidity, TrustBlockerError, ValidatedDataset
+from marketdata.dataset import (
+    MarketDataValidity,
+    TrustBlockerError,
+    ValidatedDataset,
+    ValidationPolicy,
+)
 from marketdata.evidence import ValidationReportSnapshot
 from marketdata.identity import DatasetIdentity, dataset_digest
 from marketdata.schemas import (
@@ -24,10 +30,9 @@ from marketdata.schemas import (
     OPEN,
     TS,
     VOLUME,
-    SchemaError,
     canonicalise,
 )
-from marketdata.validator import Severity, ValidationIssue, ValidationReport
+from marketdata.validator import ValidationReport
 
 
 def _identity(**overrides) -> DatasetIdentity:
@@ -36,10 +41,9 @@ def _identity(**overrides) -> DatasetIdentity:
     return DatasetIdentity(**fields)
 
 
-def _valid_rows(n: int = 5) -> pd.DataFrame:
-    base = 24000.0
+def _valid_rows(n: int = 5, *, start: str = "2026-01-01 09:15", base: float = 24000.0) -> pd.DataFrame:
     rows = []
-    ts0 = pd.Timestamp("2026-01-01 09:15", tz=IST_NAME)
+    ts0 = pd.Timestamp(start, tz=IST_NAME)
     for i in range(n):
         rows.append(
             {
@@ -55,8 +59,8 @@ def _valid_rows(n: int = 5) -> pd.DataFrame:
 
 
 def _invalid_ohlc_rows() -> pd.DataFrame:
-    # high < low: an impossible bar. Structurally canonical (right dtypes,
-    # sorted), but market-data-invalid.
+    # high < low: an impossible bar. Structurally canonicalisable, but
+    # market-data-invalid.
     return pd.DataFrame(
         {
             TS: [pd.Timestamp("2026-01-01 09:15", tz=IST_NAME)],
@@ -85,18 +89,163 @@ def _conflicting_timestamp_rows() -> pd.DataFrame:
     )
 
 
+# --- Bug 1 regression: forged canonicalisation evidence ---------------------
+
+
+def test_forged_canonicalisation_result_can_no_longer_be_supplied():
+    # The old API accepted a CanonicalisationResult directly; build() no
+    # longer has such a parameter at all, so this kind of forgery is
+    # structurally impossible rather than merely discouraged.
+    import inspect
+
+    params = inspect.signature(ValidatedDataset.build).parameters
+    assert "canonicalisation" not in params
+    assert set(params) == {"raw_frame", "identity", "validation_policy"}
+
+
+def test_forged_canonicalisation_result_rejected_if_attempted():
+    frame_a = _valid_rows(n=3, start="2026-01-01 09:15", base=100.0)
+    frame_b = _valid_rows(n=7, start="2026-02-01 09:15", base=900000.0)
+    canon_a = canonicalise(frame_a)
+    canon_b = canonicalise(frame_b)
+
+    # There is no parameter to pass canon_b's evidence alongside canon_a's
+    # frame at all -- attempting the old call shape is a TypeError.
+    with pytest.raises(TypeError):
+        ValidatedDataset.build(
+            canon_a.frame,
+            identity=_identity(),
+            transformations=canon_b.transformations,
+            source_anomalies=canon_b.source_anomalies,
+            source=canon_b.source,
+        )
+
+
+# --- build canonicalises internally ------------------------------------------
+
+
+def test_build_accepts_raw_dataframe_and_canonicalises_internally():
+    raw = _valid_rows()
+    ds = ValidatedDataset.build(raw, identity=_identity())
+    # The bound frame is canonical (tz-aware IST, float64 prices, Int64
+    # volume, sorted) even though `raw` itself was never canonicalised by
+    # the caller.
+    assert str(ds.frame[TS].dtype.tz) == IST_NAME
+    assert ds.frame[OPEN].dtype == "float64"
+    assert str(ds.frame[VOLUME].dtype) == "Int64"
+
+
+def test_source_evidence_corresponds_to_the_raw_frame_supplied():
+    raw = _valid_rows(n=4)
+    ds = ValidatedDataset.build(raw, identity=_identity())
+    assert ds.source_evidence.row_count == 4
+
+
+def test_caller_raw_frame_mutation_after_build_changes_nothing():
+    raw = _valid_rows()
+    ds = ValidatedDataset.build(raw, identity=_identity())
+    original_digest = ds.digest
+    original_frame = ds.frame
+
+    raw.iloc[0, raw.columns.get_loc(OPEN)] = -999.0
+
+    assert ds.digest == original_digest
+    pd.testing.assert_frame_equal(ds.frame, original_frame)
+
+
+def test_adversarial_build_valid_then_mutate_caller_raw_frame_into_invalid():
+    raw = _valid_rows()
+    identity = _identity()
+    ds = ValidatedDataset.build(raw, identity=identity)
+
+    original_digest = ds.digest
+    original_validity = ds.market_data_validity
+    original_frame = ds.frame
+
+    raw.iloc[0, raw.columns.get_loc(HIGH)] = -1.0  # would trip an OHLC error
+
+    assert ds.digest == original_digest
+    assert ds.market_data_validity == original_validity
+    pd.testing.assert_frame_equal(ds.frame, original_frame)
+    assert ds.validation.is_usable is True
+
+
+# --- ValidationPolicy ---------------------------------------------------------
+
+
+def test_validation_policy_is_frozen():
+    policy = ValidationPolicy(max_session_gap_days=3.0)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        policy.max_session_gap_days = 5.0
+
+
+def test_validation_policy_values_are_exposed_exactly():
+    policy = ValidationPolicy(
+        expected_interval_minutes=1,
+        sigma_threshold=8.0,
+        session_window=None,
+        max_session_gap_days=3.0,
+    )
+    ds = ValidatedDataset.build(_valid_rows(), identity=_identity(), validation_policy=policy)
+    assert ds.validation_policy == policy
+    assert ds.validation_policy.expected_interval_minutes == 1
+    assert ds.validation_policy.sigma_threshold == 8.0
+    assert ds.validation_policy.max_session_gap_days == 3.0
+
+
+def test_default_validation_policy_matches_validate_defaults():
+    ds = ValidatedDataset.build(_valid_rows(), identity=_identity())
+    assert ds.validation_policy == ValidationPolicy()
+
+
+def test_different_max_session_gap_days_can_change_validity_same_digest():
+    # A gap larger than a strict max_session_gap_days is an ERROR
+    # (EXCESSIVE_DATA_GAP); the same gap under a lenient/unset policy is not
+    # necessarily an ERROR. Same frame + identity -> same data_digest either
+    # way, since the policy is not part of identity.
+    ts0 = pd.Timestamp("2026-01-01 09:15", tz=IST_NAME)
+    raw = pd.DataFrame(
+        {
+            TS: [ts0, ts0 + pd.Timedelta(minutes=1), ts0 + pd.Timedelta(days=10)],
+            OPEN: [100.0, 101.0, 102.0],
+            HIGH: [105.0, 106.0, 107.0],
+            LOW: [95.0, 96.0, 97.0],
+            CLOSE: [101.0, 102.0, 103.0],
+            VOLUME: [1000, 1001, 1002],
+        }
+    )
+    identity = _identity()
+
+    lenient = ValidatedDataset.build(
+        raw,
+        identity=identity,
+        validation_policy=ValidationPolicy(expected_interval_minutes=1),
+    )
+    strict = ValidatedDataset.build(
+        raw,
+        identity=identity,
+        validation_policy=ValidationPolicy(
+            expected_interval_minutes=1, max_session_gap_days=1.0
+        ),
+    )
+
+    assert lenient.digest == strict.digest
+    assert lenient.market_data_validity == MarketDataValidity.VALID
+    assert strict.market_data_validity == MarketDataValidity.INVALID
+    assert "EXCESSIVE_DATA_GAP" in {i.code for i in strict.validation.errors}
+
+
 # --- report generated internally, never accepted as a parameter ------------
 
 
 def test_build_generates_validation_report_internally():
-    canon = canonicalise(_valid_rows())
-    ds = ValidatedDataset.build(canon, identity=_identity())
+    ds = ValidatedDataset.build(_valid_rows(), identity=_identity())
     assert isinstance(ds.validation, ValidationReportSnapshot)
     assert ds.validation.symbol == "NIFTY"
     assert ds.validation.resolution == "1"
 
 
-def test_build_signature_has_no_report_parameter():
+def test_build_signature_has_no_report_or_digest_parameter():
     import inspect
 
     params = inspect.signature(ValidatedDataset.build).parameters
@@ -107,7 +256,6 @@ def test_build_signature_has_no_report_parameter():
 
 
 def test_build_rejects_a_caller_supplied_report_kwarg():
-    canon = canonicalise(_valid_rows())
     fake_report = ValidationReport(
         symbol="SBIN",
         resolution="5",
@@ -117,7 +265,12 @@ def test_build_rejects_a_caller_supplied_report_kwarg():
         timezone="Asia/Kolkata",
     )
     with pytest.raises(TypeError):
-        ValidatedDataset.build(canon, identity=_identity(), report=fake_report)
+        ValidatedDataset.build(_valid_rows(), identity=_identity(), report=fake_report)
+
+
+def test_build_rejects_a_caller_supplied_digest_kwarg():
+    with pytest.raises(TypeError):
+        ValidatedDataset.build(_valid_rows(), identity=_identity(), digest="0" * 64)
 
 
 def test_direct_construction_is_blocked():
@@ -129,26 +282,22 @@ def test_direct_construction_is_blocked():
 
 
 def test_valid_frame_builds_usable_dataset():
-    canon = canonicalise(_valid_rows())
     identity = _identity()
-    ds = ValidatedDataset.build(canon, identity=identity)
+    ds = ValidatedDataset.build(_valid_rows(), identity=identity)
     assert ds.market_data_validity is MarketDataValidity.VALID
     assert ds.validation.is_usable is True
-    assert ds.digest == dataset_digest(identity, canon.frame)
+    assert ds.digest == dataset_digest(identity, ds.frame)
 
 
 # --- invalid OHLC frame: validated, possibly invalid ------------------------
 
 
 def test_invalid_ohlc_frame_still_builds_with_error_evidence():
-    canon = canonicalise(_invalid_ohlc_rows())
-    ds = ValidatedDataset.build(canon, identity=_identity())
+    ds = ValidatedDataset.build(_invalid_ohlc_rows(), identity=_identity())
     assert ds.market_data_validity is MarketDataValidity.INVALID
     assert ds.validation.is_usable is False
     codes = {i.code for i in ds.validation.errors}
     assert "OHLC_HIGH_BELOW_LOW" in codes
-    # Still produces a real digest -- it is a validated (invalid) dataset,
-    # not a refused build.
     assert len(ds.digest) == 64
 
 
@@ -157,47 +306,14 @@ def test_trust_blocker_anomaly_prevents_build():
     codes = {a.code for a in canon.source_anomalies}
     assert "CANONICAL_CONFLICTING_TIMESTAMPS" in codes
     with pytest.raises(TrustBlockerError):
-        ValidatedDataset.build(canon, identity=_identity())
+        ValidatedDataset.build(_conflicting_timestamp_rows(), identity=_identity())
 
 
-def test_noncanonical_frame_in_canonicalisation_result_rejected():
-    # Defence in depth: a hand-crafted, counterfeit CanonicalisationResult
-    # whose .frame is not actually canonical must still be rejected.
-    import marketdata.schemas as schemas_module
-
-    canon = canonicalise(_valid_rows())
-    bogus_frame = canon.frame.iloc[::-1].reset_index(drop=True)  # now unsorted
-    bogus = schemas_module.CanonicalisationResult(
-        frame=bogus_frame,
-        transformations=canon.transformations,
-        source_anomalies=canon.source_anomalies,
-        source=canon.source,
-    )
-    with pytest.raises(SchemaError):
-        ValidatedDataset.build(bogus, identity=_identity())
-
-
-# --- mutation independence ---------------------------------------------------
-
-
-def test_mutating_source_canonicalisation_frame_after_build_has_no_effect():
-    canon = canonicalise(_valid_rows())
-    identity = _identity()
-    ds = ValidatedDataset.build(canon, identity=identity)
-    original_digest = ds.digest
-    original_frame = ds.frame
-
-    # Mutate the CanonicalisationResult's own frame reference, which the
-    # caller still holds, into something structurally different.
-    canon.frame.iloc[0, canon.frame.columns.get_loc(OPEN)] = -999.0
-
-    assert ds.digest == original_digest
-    pd.testing.assert_frame_equal(ds.frame, original_frame)
+# --- mutation independence: returned frame -----------------------------------
 
 
 def test_mutating_returned_frame_has_no_effect():
-    canon = canonicalise(_valid_rows())
-    ds = ValidatedDataset.build(canon, identity=_identity())
+    ds = ValidatedDataset.build(_valid_rows(), identity=_identity())
     original_digest = ds.digest
 
     returned = ds.frame
@@ -207,62 +323,49 @@ def test_mutating_returned_frame_has_no_effect():
     assert ds.digest == original_digest
 
 
-def test_adversarial_build_valid_then_mutate_caller_frame_into_invalid():
-    raw = _valid_rows()
-    canon = canonicalise(raw)
-    identity = _identity()
-    ds = ValidatedDataset.build(canon, identity=identity)
-
-    original_digest = ds.digest
-    original_validity = ds.market_data_validity
-    original_frame = ds.frame
-
-    # Corrupt the caller's own canonicalisation result into OHLC-invalid data.
-    col = canon.frame.columns.get_loc(HIGH)
-    canon.frame.iloc[0, col] = -1.0  # would trip OHLC_HIGH_TOO_LOW / negative price
-
-    assert ds.digest == original_digest
-    assert ds.market_data_validity == original_validity
-    pd.testing.assert_frame_equal(ds.frame, original_frame)
-    assert ds.validation.is_usable is True  # unchanged from the original valid build
+def test_returned_frame_remains_a_defensive_copy_each_access():
+    ds = ValidatedDataset.build(_valid_rows(), identity=_identity())
+    first = ds.frame
+    second = ds.frame
+    assert first is not second
+    pd.testing.assert_frame_equal(first, second)
 
 
 # --- digest / identity behaviour ---------------------------------------------
 
 
 def test_digest_matches_internal_frame():
-    canon = canonicalise(_valid_rows())
     identity = _identity()
-    ds = ValidatedDataset.build(canon, identity=identity)
+    ds = ValidatedDataset.build(_valid_rows(), identity=identity)
     assert ds.digest == dataset_digest(identity, ds.frame)
 
 
 def test_different_symbol_changes_digest():
-    canon = canonicalise(_valid_rows())
-    d1 = ValidatedDataset.build(canon, identity=_identity(symbol="NIFTY")).digest
-    d2 = ValidatedDataset.build(canon, identity=_identity(symbol="SBIN")).digest
+    raw = _valid_rows()
+    d1 = ValidatedDataset.build(raw, identity=_identity(symbol="NIFTY")).digest
+    d2 = ValidatedDataset.build(raw, identity=_identity(symbol="SBIN")).digest
     assert d1 != d2
 
 
 def test_different_source_changes_digest():
-    canon = canonicalise(_valid_rows())
-    d1 = ValidatedDataset.build(canon, identity=_identity(source="fyers:history")).digest
-    d2 = ValidatedDataset.build(canon, identity=_identity(source="other")).digest
+    raw = _valid_rows()
+    d1 = ValidatedDataset.build(raw, identity=_identity(source="fyers:history")).digest
+    d2 = ValidatedDataset.build(raw, identity=_identity(source="other")).digest
     assert d1 != d2
 
 
 def test_different_resolution_changes_digest():
-    canon = canonicalise(_valid_rows())
-    d1 = ValidatedDataset.build(canon, identity=_identity(resolution="1")).digest
-    d2 = ValidatedDataset.build(canon, identity=_identity(resolution="5")).digest
+    raw = _valid_rows()
+    d1 = ValidatedDataset.build(raw, identity=_identity(resolution="1")).digest
+    d2 = ValidatedDataset.build(raw, identity=_identity(resolution="5")).digest
     assert d1 != d2
 
 
 def test_build_is_deterministic():
-    canon = canonicalise(_valid_rows())
+    raw = _valid_rows()
     identity = _identity()
-    ds1 = ValidatedDataset.build(canon, identity=identity)
-    ds2 = ValidatedDataset.build(canon, identity=identity)
+    ds1 = ValidatedDataset.build(raw, identity=identity)
+    ds2 = ValidatedDataset.build(raw, identity=identity)
     assert ds1.digest == ds2.digest
 
 
@@ -270,14 +373,14 @@ def test_build_is_deterministic():
 
 
 def test_validation_snapshot_is_immutable():
-    ds = ValidatedDataset.build(canonicalise(_valid_rows()), identity=_identity())
+    ds = ValidatedDataset.build(_valid_rows(), identity=_identity())
     with pytest.raises(dataclasses.FrozenInstanceError):
         ds.validation.symbol = "SBIN"
     assert isinstance(ds.validation.issues, tuple)
 
 
 def test_canonicalisation_evidence_is_immutable_tuples():
-    ds = ValidatedDataset.build(canonicalise(_valid_rows()), identity=_identity())
+    ds = ValidatedDataset.build(_valid_rows(), identity=_identity())
     assert isinstance(ds.transformations, tuple)
     assert isinstance(ds.source_anomalies, tuple)
     with pytest.raises(AttributeError):
@@ -285,7 +388,7 @@ def test_canonicalisation_evidence_is_immutable_tuples():
 
 
 def test_dataset_object_itself_is_immutable():
-    ds = ValidatedDataset.build(canonicalise(_valid_rows()), identity=_identity())
+    ds = ValidatedDataset.build(_valid_rows(), identity=_identity())
     with pytest.raises(AttributeError):
         ds.digest = "0" * 64
     with pytest.raises(AttributeError):
@@ -295,7 +398,7 @@ def test_dataset_object_itself_is_immutable():
 def test_dataset_cannot_be_pickled():
     import pickle
 
-    ds = ValidatedDataset.build(canonicalise(_valid_rows()), identity=_identity())
+    ds = ValidatedDataset.build(_valid_rows(), identity=_identity())
     with pytest.raises(TypeError):
         pickle.dumps(ds)
 
@@ -304,9 +407,8 @@ def test_dataset_cannot_be_pickled():
 
 
 def test_returned_frame_is_an_ordinary_mutable_dataframe():
-    ds = ValidatedDataset.build(canonicalise(_valid_rows()), identity=_identity())
+    ds = ValidatedDataset.build(_valid_rows(), identity=_identity())
     returned = ds.frame
     # No exception: pandas DataFrames are never claimed immutable here.
     returned.iloc[0, returned.columns.get_loc(OPEN)] = 12345.0
     assert returned.iloc[0][OPEN] == 12345.0
-    # But the object's own bound frame is unaffected (already covered above).
