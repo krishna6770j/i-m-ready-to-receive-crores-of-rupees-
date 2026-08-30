@@ -27,33 +27,67 @@ class OrderPlacementBlockedError(RuntimeError):
     """Raised when application code reaches for an order-placement method."""
 
 
-class ReadOnlyFyersClient:
-    """Whitelist wrapper over the FYERS SDK client.
+_ORDER_METHOD_MARKERS = (
+    "order",
+    "position",
+    "exit",
+    "convert",
+    "smart",
+    "alert",
+    "gtt",
+    "basket",
+    "multileg",
+    "funds",
+    "holding",
+)
 
-    Only ``ALLOWED_METHODS`` are reachable. Anything else raises, with
-    order-related names raising a distinct, loud error.
+
+def _forward(inner, name: str):
+    """Wrap one SDK method in a plain function.
+
+    A *bound method* would expose the SDK through ``__self__``, so each call is
+    wrapped in a module-level closure instead. The resulting callable has no
+    ``__self__`` and no attribute referencing the client.
     """
 
-    _ORDER_METHOD_MARKERS = (
-        "order",
-        "position",
-        "exit",
-        "convert",
-        "smart",
-        "alert",
-        "gtt",
-        "basket",
-        "multileg",
-    )
+    target = getattr(inner, name)
+
+    def call(*args, **kwargs):
+        return target(*args, **kwargs)
+
+    call.__name__ = name
+    call.__qualname__ = f"ReadOnlyFyersClient.{name}"
+    call.__doc__ = f"Read-only forward to FYERS {name}()."
+    return call
+
+
+class ReadOnlyFyersClient:
+    """Read-only capability object over the FYERS SDK.
+
+    The SDK client is NOT stored on this object. Only the four allowlisted
+    calls are captured, each as a plain closure, so ordinary attribute
+    inspection -- ``client.<anything>``, ``vars(client)``, ``dir(client)`` --
+    cannot reach an order-capable object.
+
+    BOUNDARY, stated honestly: Python has no true object containment. A
+    determined caller can still reach the SDK through closure introspection
+    (``client.history.__closure__[0].cell_contents``), and nothing in a dynamic
+    language can prevent that. This class removes ACCIDENTAL reach and makes
+    deliberate reach obvious in review. The real controls are that no order
+    call site exists in this codebase, that no order endpoint is defined in
+    ``endpoints.py``, and that an AST test fails the suite if one is added.
+    """
+
+    __slots__ = tuple(sorted(ALLOWED_METHODS))
 
     def __init__(self, inner) -> None:
-        object.__setattr__(self, "_inner", inner)
+        for name in self.__slots__:
+            object.__setattr__(self, name, _forward(inner, name))
 
     def __getattr__(self, name: str):
-        if name in ALLOWED_METHODS:
-            return getattr(object.__getattribute__(self, "_inner"), name)
+        # Reached only for names not in __slots__.
         lowered = name.lower()
-        if any(marker in lowered for marker in self._ORDER_METHOD_MARKERS):
+        if any(marker in lowered for marker in _ORDER_METHOD_MARKERS):
             raise OrderPlacementBlockedError(
                 f"Access to {name!r} is blocked. This project is read-only: it has "
                 "no approved execution path, and live order placement requires an "

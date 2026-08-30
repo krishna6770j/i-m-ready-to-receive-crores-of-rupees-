@@ -293,45 +293,102 @@ def test_token_does_not_reach_the_log_file(tmp_path, monkeypatch):
 # --- read-only client guard ----------------------------------------------
 
 
+class _OrderCapableSDK:
+    """Stands in for FyersModel: has read methods AND order methods."""
+
+    def history(self, data=None):
+        return {"s": "ok", "candles": []}
+
+    def quotes(self, data=None):
+        return {"s": "ok"}
+
+    def get_profile(self):
+        return {"s": "ok"}
+
+    def market_status(self):
+        return {"s": "ok"}
+
+    def place_order(self, data):
+        raise AssertionError("place_order must never be reachable in a test")
+
+    def positions(self):
+        raise AssertionError("positions must never be reachable in a test")
+
+
 def test_read_only_client_blocks_order_methods():
     from brokers.fyers.client import OrderPlacementBlockedError, ReadOnlyFyersClient
 
-    client = ReadOnlyFyersClient(object())
+    client = ReadOnlyFyersClient(_OrderCapableSDK())
     for name in ("place_order", "modify_order", "cancel_order", "exit_positions"):
         with pytest.raises(OrderPlacementBlockedError, match="blocked"):
             getattr(client, name)
 
 
-def test_read_only_client_blocks_position_access():
+def test_read_only_client_blocks_position_and_funds_access():
     from brokers.fyers.client import OrderPlacementBlockedError, ReadOnlyFyersClient
 
-    client = ReadOnlyFyersClient(object())
-    with pytest.raises(OrderPlacementBlockedError):
-        getattr(client, "positions")
+    client = ReadOnlyFyersClient(_OrderCapableSDK())
+    for name in ("positions", "funds", "holdings"):
+        with pytest.raises(OrderPlacementBlockedError):
+            getattr(client, name)
 
 
 def test_read_only_client_allows_history():
     from brokers.fyers.client import ReadOnlyFyersClient
 
-    class Inner:
-        def history(self, data=None):
-            return {"s": "ok", "candles": []}
-
-    client = ReadOnlyFyersClient(Inner())
+    client = ReadOnlyFyersClient(_OrderCapableSDK())
     assert client.history(data={})["s"] == "ok"
 
 
 def test_read_only_client_rejects_unknown_attribute():
     from brokers.fyers.client import ReadOnlyFyersClient
 
-    client = ReadOnlyFyersClient(object())
+    client = ReadOnlyFyersClient(_OrderCapableSDK())
     with pytest.raises(AttributeError, match="allowlist"):
-        getattr(client, "funds")
+        getattr(client, "tradebook")
 
 
 def test_read_only_client_is_immutable():
     from brokers.fyers.client import ReadOnlyFyersClient
 
-    client = ReadOnlyFyersClient(object())
+    client = ReadOnlyFyersClient(_OrderCapableSDK())
     with pytest.raises(AttributeError, match="immutable"):
         client.anything = 1
+
+
+# --- the actual containment properties, not just the happy path ----------
+
+
+def test_sdk_object_is_not_stored_as_an_attribute():
+    """Regression: the SDK was reachable via client._inner in one step."""
+    from brokers.fyers.client import ReadOnlyFyersClient
+
+    client = ReadOnlyFyersClient(_OrderCapableSDK())
+    with pytest.raises((AttributeError, Exception)):
+        getattr(client, "_inner")
+    assert not hasattr(client, "__dict__"), "__slots__ must prevent an instance dict"
+
+
+def test_vars_does_not_expose_the_sdk():
+    """Regression: vars(client)['_inner'].place_order(...) used to work."""
+    from brokers.fyers.client import ReadOnlyFyersClient
+
+    client = ReadOnlyFyersClient(_OrderCapableSDK())
+    with pytest.raises(TypeError):
+        vars(client)
+
+
+def test_public_surface_is_exactly_the_allowlist():
+    from brokers.fyers.client import ALLOWED_METHODS, ReadOnlyFyersClient
+
+    client = ReadOnlyFyersClient(_OrderCapableSDK())
+    public = {n for n in dir(client) if not n.startswith("__")}
+    assert public == set(ALLOWED_METHODS), f"unexpected public surface: {public}"
+
+
+def test_forwarded_callables_do_not_expose_self():
+    """A bound method would leak the SDK via __self__; closures do not."""
+    from brokers.fyers.client import ReadOnlyFyersClient
+
+    client = ReadOnlyFyersClient(_OrderCapableSDK())
+    assert not hasattr(client.history, "__self__")
