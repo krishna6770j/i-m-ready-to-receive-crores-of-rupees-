@@ -84,7 +84,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from marketdata.dataset import ValidatedDataset
+from marketdata.dataset import MarketDataValidity, ValidatedDataset
 from marketdata.locator import CurrentPointer, safe_slug
 from marketdata.provenance import Namespace, ProvenanceEnvelope
 
@@ -196,6 +196,20 @@ def _verify_consistency(dataset: ValidatedDataset, envelope: ProvenanceEnvelope)
     if dataset.validation_policy != envelope.validation_policy:
         raise GenerationConsistencyError(
             "dataset.validation_policy does not match envelope.validation_policy."
+        )
+    if (
+        envelope.namespace is Namespace.TRUSTED
+        and dataset.market_data_validity is not MarketDataValidity.VALID
+    ):
+        raise GenerationConsistencyError(
+            f"Refusing to write: dataset.market_data_validity is "
+            f"{dataset.market_data_validity.value}, but envelope.namespace is "
+            "TRUSTED. A TRUSTED write requires MarketDataValidity == VALID "
+            "(frozen architecture section 10/13). An invalid-but-buildable "
+            "dataset may only be persisted via an explicit FORCED envelope "
+            "(ProvenanceEnvelope.build(dataset, forced=True, "
+            "force_reason=<non-empty>)) -- this is never silently converted "
+            "here; the operator must choose force explicitly."
         )
 
 

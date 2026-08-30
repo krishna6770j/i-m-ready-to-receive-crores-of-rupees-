@@ -14,7 +14,7 @@ import pytest
 
 import marketdata.generation_store as generation_store
 from core.timeutils import IST_NAME
-from marketdata.dataset import ValidatedDataset
+from marketdata.dataset import MarketDataValidity, ValidatedDataset, ValidationPolicy
 from marketdata.generation_store import (
     GenerationAlreadyExistsError,
     GenerationConsistencyError,
@@ -52,6 +52,26 @@ def _frame(n: int = 3, *, base: float = 100.0) -> pd.DataFrame:
 
 def _dataset(*, base: float = 100.0, **identity_overrides) -> ValidatedDataset:
     return ValidatedDataset.build(_frame(base=base), identity=_identity(**identity_overrides))
+
+
+def _invalid_frame() -> pd.DataFrame:
+    # high < low: an impossible bar -- MarketDataValidity.INVALID.
+    return pd.DataFrame(
+        {
+            TS: [pd.Timestamp("2026-01-01 09:15", tz=IST_NAME)],
+            OPEN: [100.0],
+            HIGH: [50.0],
+            LOW: [200.0],
+            CLOSE: [100.0],
+            VOLUME: [1000],
+        }
+    )
+
+
+def _invalid_dataset(**identity_overrides) -> ValidatedDataset:
+    ds = ValidatedDataset.build(_invalid_frame(), identity=_identity(**identity_overrides))
+    assert ds.market_data_validity is MarketDataValidity.INVALID
+    return ds
 
 
 def _current_path(result: GenerationWriteResult) -> Path:
@@ -160,8 +180,8 @@ def test_mismatched_dataset_and_envelope_rejected_before_write(tmp_path):
 
 
 def test_data_digest_mismatch_rejected_before_any_write(tmp_path):
-    ds_a = _dataset(base=1.0)
-    ds_b = _dataset(base=2.0)
+    ds_a = _dataset(base=100.0)
+    ds_b = _dataset(base=200.0)
     env_b = ProvenanceEnvelope.build(ds_b)
     assert ds_a.digest != env_b.data_digest
 
@@ -325,7 +345,7 @@ def test_forced_write_sequence_has_no_current_steps(tmp_path, monkeypatch):
 
 
 def test_failed_parquet_write_leaves_current_unchanged(tmp_path, monkeypatch):
-    ds0 = _dataset(base=1.0)
+    ds0 = _dataset(base=100.0)
     env0 = ProvenanceEnvelope.build(ds0)
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
@@ -335,7 +355,7 @@ def test_failed_parquet_write_leaves_current_unchanged(tmp_path, monkeypatch):
 
     monkeypatch.setattr(generation_store, "_write_data_parquet", boom)
 
-    ds1 = _dataset(base=2.0)
+    ds1 = _dataset(base=200.0)
     env1 = ProvenanceEnvelope.build(ds1)
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
@@ -348,7 +368,7 @@ def test_failed_parquet_write_leaves_current_unchanged(tmp_path, monkeypatch):
 
 
 def test_failed_manifest_write_leaves_current_unchanged(tmp_path, monkeypatch):
-    ds0 = _dataset(base=1.0)
+    ds0 = _dataset(base=100.0)
     env0 = ProvenanceEnvelope.build(ds0)
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
@@ -362,7 +382,7 @@ def test_failed_manifest_write_leaves_current_unchanged(tmp_path, monkeypatch):
 
     monkeypatch.setattr(generation_store, "_write_text", selective_boom)
 
-    ds1 = _dataset(base=2.0)
+    ds1 = _dataset(base=200.0)
     env1 = ProvenanceEnvelope.build(ds1)
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
@@ -374,7 +394,7 @@ def test_failed_manifest_write_leaves_current_unchanged(tmp_path, monkeypatch):
 
 
 def test_failed_current_tmp_write_leaves_current_unchanged(tmp_path, monkeypatch):
-    ds0 = _dataset(base=1.0)
+    ds0 = _dataset(base=100.0)
     env0 = ProvenanceEnvelope.build(ds0)
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
@@ -388,7 +408,7 @@ def test_failed_current_tmp_write_leaves_current_unchanged(tmp_path, monkeypatch
 
     monkeypatch.setattr(generation_store, "_write_text", selective_boom)
 
-    ds1 = _dataset(base=2.0)
+    ds1 = _dataset(base=200.0)
     env1 = ProvenanceEnvelope.build(ds1)
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
@@ -402,7 +422,7 @@ def test_failed_current_tmp_write_leaves_current_unchanged(tmp_path, monkeypatch
 
 
 def test_failed_os_replace_leaves_current_unchanged(tmp_path, monkeypatch):
-    ds0 = _dataset(base=1.0)
+    ds0 = _dataset(base=100.0)
     env0 = ProvenanceEnvelope.build(ds0)
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
@@ -412,7 +432,7 @@ def test_failed_os_replace_leaves_current_unchanged(tmp_path, monkeypatch):
 
     monkeypatch.setattr(generation_store, "_atomic_replace", boom)
 
-    ds1 = _dataset(base=2.0)
+    ds1 = _dataset(base=200.0)
     env1 = ProvenanceEnvelope.build(ds1)
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
@@ -421,7 +441,7 @@ def test_failed_os_replace_leaves_current_unchanged(tmp_path, monkeypatch):
 
 
 def test_orphan_generation_is_inert(tmp_path, monkeypatch):
-    ds0 = _dataset(base=1.0)
+    ds0 = _dataset(base=100.0)
     env0 = ProvenanceEnvelope.build(ds0)
     result0 = write_generation(ds0, env0, tmp_path)
 
@@ -430,7 +450,7 @@ def test_orphan_generation_is_inert(tmp_path, monkeypatch):
 
     monkeypatch.setattr(generation_store, "_atomic_replace", boom)
 
-    ds1 = _dataset(base=2.0)
+    ds1 = _dataset(base=200.0)
     env1 = ProvenanceEnvelope.build(ds1)
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
@@ -447,7 +467,7 @@ def test_orphan_generation_is_inert(tmp_path, monkeypatch):
 
 
 def test_previous_trusted_generation_remains_intact_after_failed_new_write(tmp_path, monkeypatch):
-    ds0 = _dataset(base=1.0)
+    ds0 = _dataset(base=100.0)
     env0 = ProvenanceEnvelope.build(ds0)
     result0 = write_generation(ds0, env0, tmp_path)
     original_data = (result0.generation_dir / "data.parquet").read_bytes()
@@ -458,7 +478,7 @@ def test_previous_trusted_generation_remains_intact_after_failed_new_write(tmp_p
 
     monkeypatch.setattr(generation_store, "_write_data_parquet", boom)
 
-    ds1 = _dataset(base=2.0)
+    ds1 = _dataset(base=200.0)
     env1 = ProvenanceEnvelope.build(ds1)
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
@@ -512,7 +532,7 @@ def test_parent_fsync_follows_each_newly_created_hierarchy_component(tmp_path, m
 
 
 def test_existing_hierarchy_does_not_require_recreation(tmp_path, monkeypatch):
-    ds0 = _dataset(base=1.0)
+    ds0 = _dataset(base=100.0)
     env0 = ProvenanceEnvelope.build(ds0)
     write_generation(ds0, env0, tmp_path)
 
@@ -525,7 +545,7 @@ def test_existing_hierarchy_does_not_require_recreation(tmp_path, monkeypatch):
 
     monkeypatch.setattr(generation_store, "_fsync_dir", fsync_dir)
 
-    ds1 = _dataset(base=2.0)  # same identity -> hierarchy already exists
+    ds1 = _dataset(base=200.0)  # same identity -> hierarchy already exists
     env1 = ProvenanceEnvelope.build(ds1)
     write_generation(ds1, env1, tmp_path)
 
@@ -608,7 +628,7 @@ def test_hierarchy_parent_fsync_failure_leaves_no_current(tmp_path, monkeypatch)
 
 
 def test_data_file_fsync_failure_leaves_previous_current_unchanged(tmp_path, monkeypatch):
-    ds0 = _dataset(base=1.0)
+    ds0 = _dataset(base=100.0)
     env0 = ProvenanceEnvelope.build(ds0)
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
@@ -622,7 +642,7 @@ def test_data_file_fsync_failure_leaves_previous_current_unchanged(tmp_path, mon
 
     monkeypatch.setattr(generation_store, "_fsync_file", selective_boom)
 
-    ds1 = _dataset(base=2.0)
+    ds1 = _dataset(base=200.0)
     env1 = ProvenanceEnvelope.build(ds1)
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
@@ -631,7 +651,7 @@ def test_data_file_fsync_failure_leaves_previous_current_unchanged(tmp_path, mon
 
 
 def test_manifest_fsync_failure_leaves_previous_current_unchanged(tmp_path, monkeypatch):
-    ds0 = _dataset(base=1.0)
+    ds0 = _dataset(base=100.0)
     env0 = ProvenanceEnvelope.build(ds0)
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
@@ -645,7 +665,7 @@ def test_manifest_fsync_failure_leaves_previous_current_unchanged(tmp_path, monk
 
     monkeypatch.setattr(generation_store, "_fsync_file", selective_boom)
 
-    ds1 = _dataset(base=2.0)
+    ds1 = _dataset(base=200.0)
     env1 = ProvenanceEnvelope.build(ds1)
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
@@ -654,7 +674,7 @@ def test_manifest_fsync_failure_leaves_previous_current_unchanged(tmp_path, monk
 
 
 def test_generation_dir_fsync_failure_leaves_previous_current_unchanged(tmp_path, monkeypatch):
-    ds0 = _dataset(base=1.0)
+    ds0 = _dataset(base=100.0)
     env0 = ProvenanceEnvelope.build(ds0)
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
@@ -666,7 +686,7 @@ def test_generation_dir_fsync_failure_leaves_previous_current_unchanged(tmp_path
             raise OSError("simulated fsync failure")
         return orig_fsync_dir(path)
 
-    ds1 = _dataset(base=2.0)
+    ds1 = _dataset(base=200.0)
     env1 = ProvenanceEnvelope.build(ds1)
     monkeypatch.setattr(generation_store, "_fsync_dir", selective_boom)
 
@@ -677,7 +697,7 @@ def test_generation_dir_fsync_failure_leaves_previous_current_unchanged(tmp_path
 
 
 def test_namespace_dir_fsync_failure_leaves_previous_current_unchanged(tmp_path, monkeypatch):
-    ds0 = _dataset(base=1.0)
+    ds0 = _dataset(base=100.0)
     env0 = ProvenanceEnvelope.build(ds0)
     result0 = write_generation(ds0, env0, tmp_path)
     current_before = _current_path(result0).read_text()
@@ -692,9 +712,137 @@ def test_namespace_dir_fsync_failure_leaves_previous_current_unchanged(tmp_path,
 
     monkeypatch.setattr(generation_store, "_fsync_dir", selective_boom)
 
-    ds1 = _dataset(base=2.0)
+    ds1 = _dataset(base=200.0)
     env1 = ProvenanceEnvelope.build(ds1)
     with pytest.raises(OSError):
         write_generation(ds1, env1, tmp_path)
 
     assert _current_path(result0).read_text() == current_before
+
+
+# ---------------------------------------------------------------------------
+# trust gate: MarketDataValidity.INVALID must never reach TRUSTED storage
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_dataset_with_trusted_envelope_rejected(tmp_path):
+    ds = _invalid_dataset()
+    env = ProvenanceEnvelope.build(ds, forced=False)
+    assert env.namespace is Namespace.TRUSTED
+
+    with pytest.raises(GenerationConsistencyError):
+        write_generation(ds, env, tmp_path)
+
+
+def test_invalid_trusted_rejection_happens_before_any_filesystem_mutation(tmp_path):
+    ds = _invalid_dataset()
+    env = ProvenanceEnvelope.build(ds, forced=False)
+
+    with pytest.raises(GenerationConsistencyError):
+        write_generation(ds, env, tmp_path)
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_existing_current_byte_identical_after_rejected_invalid_trusted_write(tmp_path):
+    ds_valid = _dataset()
+    env_valid = ProvenanceEnvelope.build(ds_valid)
+    result_valid = write_generation(ds_valid, env_valid, tmp_path)
+    current_before = _current_path(result_valid).read_text()
+
+    ds_invalid = _invalid_dataset()
+    env_invalid = ProvenanceEnvelope.build(ds_invalid, forced=False)
+    with pytest.raises(GenerationConsistencyError):
+        write_generation(ds_invalid, env_invalid, tmp_path)
+
+    assert _current_path(result_valid).read_text() == current_before
+
+
+def test_invalid_dataset_with_explicit_forced_envelope_persisted_under_forced(tmp_path):
+    ds = _invalid_dataset()
+    env = ProvenanceEnvelope.build(ds, forced=True, force_reason="forensic inspection")
+    assert env.namespace is Namespace.FORCED
+
+    result = write_generation(ds, env, tmp_path)
+    assert result.namespace is Namespace.FORCED
+    assert (result.generation_dir / "data.parquet").exists()
+    assert (result.generation_dir / "manifest.json").exists()
+
+
+def test_forced_invalid_write_never_changes_current(tmp_path):
+    ds_valid = _dataset()
+    env_valid = ProvenanceEnvelope.build(ds_valid)
+    result_valid = write_generation(ds_valid, env_valid, tmp_path)
+    current_before = _current_path(result_valid).read_text()
+
+    ds_invalid = _invalid_dataset()
+    env_invalid = ProvenanceEnvelope.build(ds_invalid, forced=True, force_reason="forensic")
+    result_invalid = write_generation(ds_invalid, env_invalid, tmp_path)
+
+    assert result_invalid.current_updated is False
+    assert _current_path(result_valid).read_text() == current_before
+
+
+def test_valid_trusted_dataset_still_writes_normally(tmp_path):
+    ds = _dataset()
+    assert ds.market_data_validity is MarketDataValidity.VALID
+    env = ProvenanceEnvelope.build(ds)
+    result = write_generation(ds, env, tmp_path)
+    assert result.namespace is Namespace.TRUSTED
+    assert result.current_updated is True
+
+
+def test_validation_policy_causing_invalid_also_triggers_the_gate(tmp_path):
+    # A frame that is OHLC-valid under default validation but INVALID under
+    # a stricter policy (a large gap flagged as EXCESSIVE_DATA_GAP).
+    ts0 = pd.Timestamp("2026-01-01 09:15", tz=IST_NAME)
+    raw = pd.DataFrame(
+        {
+            TS: [ts0, ts0 + pd.Timedelta(minutes=1), ts0 + pd.Timedelta(days=10)],
+            OPEN: [100.0, 101.0, 102.0],
+            HIGH: [105.0, 106.0, 107.0],
+            LOW: [95.0, 96.0, 97.0],
+            CLOSE: [101.0, 102.0, 103.0],
+            VOLUME: [1000, 1001, 1002],
+        }
+    )
+    lenient_policy = ValidationPolicy(expected_interval_minutes=1)
+    strict_policy = ValidationPolicy(expected_interval_minutes=1, max_session_gap_days=1.0)
+
+    ds_lenient = ValidatedDataset.build(raw, identity=_identity(), validation_policy=lenient_policy)
+    ds_strict = ValidatedDataset.build(raw, identity=_identity(), validation_policy=strict_policy)
+    assert ds_lenient.market_data_validity is MarketDataValidity.VALID
+    assert ds_strict.market_data_validity is MarketDataValidity.INVALID
+
+    env_lenient = ProvenanceEnvelope.build(ds_lenient, generation_id=uuid.uuid4())
+    # lenient writes fine
+    write_generation(ds_lenient, env_lenient, tmp_path)
+
+    env_strict = ProvenanceEnvelope.build(ds_strict, forced=False, generation_id=uuid.uuid4())
+    with pytest.raises(GenerationConsistencyError):
+        write_generation(ds_strict, env_strict, tmp_path)
+
+
+def test_adversarial_valid_then_invalid_trusted_attempt_leaves_current_and_disk_untouched(tmp_path):
+    # 1. write valid trusted generation A
+    ds_a = _dataset(base=100.0)
+    env_a = ProvenanceEnvelope.build(ds_a)
+    result_a = write_generation(ds_a, env_a, tmp_path)
+    current_before = _current_path(result_a).read_text()
+
+    trusted_dir = _dataset_dir_for(tmp_path, env_a) / "trusted_generations"
+    generations_before = set(trusted_dir.iterdir())
+
+    # 2. build invalid dataset B
+    ds_b = _invalid_dataset()
+    env_b = ProvenanceEnvelope.build(ds_b, forced=False)
+
+    # 3. attempt trusted write B
+    with pytest.raises(GenerationConsistencyError):
+        write_generation(ds_b, env_b, tmp_path)
+
+    # 4. assertions
+    assert _current_path(result_a).read_text() == current_before
+    b_generation_dir = trusted_dir / str(env_b.generation_id)
+    assert not b_generation_dir.exists()
+    assert set(trusted_dir.iterdir()) == generations_before

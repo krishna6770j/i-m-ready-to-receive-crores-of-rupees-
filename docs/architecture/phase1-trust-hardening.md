@@ -506,6 +506,16 @@ Selection depends on structure, not on an editable boolean. Editing
 the forced directory, and the edit additionally breaks the envelope digest and
 the §7 namespace agreement.
 
+**A TRUSTED write requires `MarketDataValidity == VALID`** (manager correction
+to Unit 8's implementation). Invalid-but-buildable datasets — a `ValidatedDataset`
+built successfully but carrying `MarketDataValidity.INVALID` (§2) — are
+persistable only through explicit FORCED storage; a TRUSTED write for one is
+rejected before any filesystem mutation, and this is never silently
+downgraded to FORCED on the caller's behalf. This is only the
+already-derived `MarketDataValidity` gate — it says nothing about
+acquisition completeness, coverage, or calendar/session rules, none of
+which exist yet (§11).
+
 ---
 
 ## 11. Acquisition evidence and coverage
