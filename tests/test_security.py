@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -51,10 +52,54 @@ def test_env_example_contains_no_values():
             assert value == "", f"{key} must be empty in .env.example, got {value!r}"
 
 
-def test_no_real_env_file_is_committed():
-    assert not (PROJECT_ROOT / ".env").exists() or ".env" in (
-        PROJECT_ROOT / ".gitignore"
-    ).read_text()
+def _git(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args], cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=30
+    )
+
+
+def test_env_is_not_tracked_by_git():
+    """Ask git directly whether .env is tracked.
+
+    Replaces a test asserting ``not .env.exists() or '.env' in .gitignore``.
+    The right operand is always true while .gitignore lists .env, so the
+    assertion could never fail and never consulted git at all -- it would
+    have passed with .env fully committed.
+    """
+    result = _git("ls-files", "--error-unmatch", ".env")
+    assert result.returncode != 0, (
+        f".env is TRACKED by git. git ls-files said: {result.stdout.strip()!r}"
+    )
+
+
+def test_env_has_never_been_committed_in_any_revision():
+    """A secret removed from HEAD still lives in history."""
+    result = _git("log", "--all", "--pretty=format:%H", "--", ".env")
+    assert result.returncode == 0, f"git log failed: {result.stderr}"
+    assert result.stdout.strip() == "", (
+        f".env appears in {len(result.stdout.split())} commit(s). "
+        "History rewriting and credential rotation are required."
+    )
+
+
+def test_generated_and_secret_paths_are_untracked():
+    """Directories that hold credentials, data or logs must stay out of git."""
+    tracked = _git("ls-files").stdout.splitlines()
+    offenders = [
+        p
+        for p in tracked
+        if p == ".env"
+        or p.startswith((".venv/", "data_store/", "logs/"))
+        or p.endswith((".pem", ".key", ".parquet"))
+    ]
+    assert not offenders, f"these must not be tracked: {offenders}"
+
+
+def test_gitignore_actually_ignores_a_real_env_file(tmp_path):
+    """Prove the ignore rule works, rather than trusting the file's text."""
+    result = _git("check-ignore", "-v", ".env")
+    assert result.returncode == 0, "git does not consider .env ignored"
+    assert ".gitignore" in result.stdout
 
 
 def _source_files() -> list[Path]:
