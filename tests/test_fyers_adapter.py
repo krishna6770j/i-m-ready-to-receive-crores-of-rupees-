@@ -145,11 +145,18 @@ def test_end_before_start_is_rejected():
 
 
 def test_failed_chunk_is_reported_not_hidden():
+    """One bad window must not discard the chunks that succeeded.
+
+    Each good chunk returns a DISTINCT block of candles, as real chunks would.
+    An earlier version of this test reused one payload for every chunk, so its
+    row-count assertion silently depended on duplicates being retained.
+    """
+    base = 1767239100
     responses = [
-        candles_payload(2),
+        candles_payload(2, start_epoch=base),
         {"s": "error", "code": -99, "message": "server error"},
-        candles_payload(2),
-        candles_payload(2),
+        candles_payload(2, start_epoch=base + 200 * 86400),
+        candles_payload(2, start_epoch=base + 300 * 86400),
     ]
     prov, _ = provider(responses)
     frame, report = prov.fetch_candles_with_report(
@@ -157,7 +164,8 @@ def test_failed_chunk_is_reported_not_hidden():
     )
     assert len(report.failed_chunks) == 1
     assert "server error" in report.failed_chunks[0].error
-    assert len(frame) == 6  # the three good chunks survived
+    assert len(frame) == 6, "the three successful chunks must all survive"
+    assert report.duplicate_rows_removed == 0
 
 
 def test_auth_failure_aborts_rather_than_partially_downloading():
@@ -181,6 +189,65 @@ def test_report_records_requested_versus_downloaded():
     assert payload["requested_to"] == "2026-01-10"
     assert payload["total_rows"] == 3
     assert payload["downloaded_first_ts"].startswith("2026-01-01T09:15")
+
+
+def test_identical_candles_across_chunks_are_collapsed_losslessly():
+    """Overlapping chunk boundaries must not inflate the dataset.
+
+    Regression: four chunks returning the same five candles previously
+    produced 20 rows with 15 duplicate timestamps.
+    """
+    prov, _ = provider(candles_payload(5))
+    frame, report = prov.fetch_candles_with_report(
+        "X", "1", date(2026, 1, 1), date(2026, 12, 31)
+    )
+    assert len(frame) == 5, "identical rows must collapse to one copy each"
+    assert frame[TS].duplicated().sum() == 0
+    assert report.duplicate_rows_removed == 15
+    assert report.conflicting_timestamps == 0
+
+
+def test_conflicting_candles_are_preserved_not_silently_resolved():
+    """The adapter must never pick a winner between contradictory candles."""
+    a = candles_payload(3)
+    b = candles_payload(3)
+    b["candles"][1][4] = 99999.0  # same timestamp, different close
+    prov, _ = provider([a, b, a, b])
+    frame, report = prov.fetch_candles_with_report(
+        "X", "1", date(2026, 1, 1), date(2026, 12, 31)
+    )
+    assert report.conflicting_timestamps == 1
+    conflicting = frame[frame[TS].duplicated(keep=False)]
+    closes = set(conflicting["close"].tolist())
+    assert 99999.0 in closes and len(closes) == 2, (
+        "both contradictory observations must survive for the validator to flag"
+    )
+
+
+def test_conflicting_chunk_data_fails_validation():
+    """End-to-end: a boundary conflict must make the dataset unusable."""
+    from marketdata.validator import validate
+
+    a = candles_payload(3)
+    b = candles_payload(3)
+    b["candles"][1][4] = 99999.0
+    prov, _ = provider([a, b])
+    frame, _ = prov.fetch_candles_with_report(
+        "X", "1", date(2026, 1, 1), date(2026, 6, 30)
+    )
+    report = validate(frame, symbol="X", resolution="1", expected_interval_minutes=1)
+    assert "DUPLICATE_TIMESTAMPS" in {i.code for i in report.issues}
+    assert not report.is_usable
+
+
+def test_dedup_counts_appear_in_fetch_report_dict():
+    prov, _ = provider(candles_payload(5))
+    _, report = prov.fetch_candles_with_report(
+        "X", "1", date(2026, 1, 1), date(2026, 12, 31)
+    )
+    payload = report.to_dict()
+    assert payload["duplicate_rows_removed"] == 15
+    assert payload["conflicting_timestamps"] == 0
 
 
 def test_empty_chunks_are_counted():

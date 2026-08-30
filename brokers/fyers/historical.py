@@ -59,6 +59,8 @@ class FetchReport:
     total_rows: int = 0
     first_ts: str | None = None
     last_ts: str | None = None
+    duplicate_rows_removed: int = 0
+    conflicting_timestamps: int = 0
 
     @property
     def failed_chunks(self) -> list[ChunkResult]:
@@ -80,6 +82,8 @@ class FetchReport:
             "chunks_requested": len(self.chunks),
             "chunks_failed": len(self.failed_chunks),
             "chunks_empty": len(self.empty_chunks),
+            "duplicate_rows_removed": self.duplicate_rows_removed,
+            "conflicting_timestamps": self.conflicting_timestamps,
             # Consumed by the storage layer to decide whether this acquisition
             # may be represented as complete.
             "failed_chunk_detail": [
@@ -247,6 +251,31 @@ class FyersHistoricalData(HistoricalDataProvider):
         combined = (
             normalise(pd.concat(frames, ignore_index=True)) if frames else empty_ohlcv()
         )
+
+        # Chunk boundaries can overlap: brokers commonly treat range_from and
+        # range_to as inclusive, so the same candle may arrive in two chunks.
+        # Two distinct cases, handled differently on purpose:
+        #
+        #   1. Byte-identical rows carry no information beyond the first copy,
+        #      so collapsing them is lossless. Recorded, not silent.
+        #   2. Rows sharing a timestamp but disagreeing on OHLCV are a genuine
+        #      conflict. This code REFUSES to choose between them -- picking one
+        #      would silently discard a contradictory observation of the same
+        #      minute. They are left in place so the validator raises
+        #      DUPLICATE_TIMESTAMPS, and the count is surfaced here.
+        before = len(combined)
+        combined = combined.drop_duplicates(keep="first").reset_index(drop=True)
+        report.duplicate_rows_removed = before - len(combined)
+
+        conflicts = combined[TS].duplicated(keep=False)
+        report.conflicting_timestamps = int(combined.loc[conflicts, TS].nunique())
+        if report.conflicting_timestamps:
+            logger.error(
+                "%d timestamp(s) appear more than once with DIFFERENT values across "
+                "chunk boundaries; not resolved automatically",
+                report.conflicting_timestamps,
+            )
+
         report.total_rows = len(combined)
         if len(combined):
             report.first_ts = combined[TS].iloc[0].isoformat()
