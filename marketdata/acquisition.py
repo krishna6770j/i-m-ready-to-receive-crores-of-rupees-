@@ -71,6 +71,39 @@ def _parse_date(value: object, field_name: str) -> date:
         ) from exc
 
 
+# --- strict field-type enforcement ---------------------------------------------
+#
+# Dataclasses do not enforce their type annotations at runtime. A caller can
+# construct a ChunkResultSnapshot/FetchReportSnapshot with ok="false" (a
+# truthy string), rows=True (bool is a subclass of int -- indistinguishable
+# from an int by isinstance alone), rows=1.5, or a string where an int is
+# required, and every downstream truthiness/comparison check silently
+# accepts it (or raises a raw TypeError, e.g. comparing str < int). These
+# helpers make every such value produce a domain-level AcquisitionError.
+
+
+def _require_bool(value: object, field_name: str) -> bool:
+    if type(value) is not bool:
+        raise AcquisitionError(
+            f"{field_name} must be an actual bool, got {value!r} "
+            f"({type(value).__name__})."
+        )
+    return value
+
+
+def _require_nonnegative_int(value: object, field_name: str) -> int:
+    # bool is a subclass of int, so isinstance(True, int) is True -- reject
+    # it explicitly with `type(value) is int` rather than isinstance.
+    if type(value) is not int:
+        raise AcquisitionError(
+            f"{field_name} must be an actual int, got {value!r} "
+            f"({type(value).__name__})."
+        )
+    if value < 0:
+        raise AcquisitionError(f"{field_name} must be >= 0, got {value}.")
+    return value
+
+
 # --- internal fetch-evidence validation --------------------------------------
 
 
@@ -87,18 +120,17 @@ def _validate_chunk(chunk: ChunkResultSnapshot, index: int) -> tuple[date, date]
             f"chunks[{index}].range_from ({chunk.range_from}) is after "
             f"range_to ({chunk.range_to})."
         )
-    if chunk.ok:
-        if chunk.rows < 0:
-            raise AcquisitionError(
-                f"chunks[{index}] is ok=True but rows is negative ({chunk.rows})."
-            )
+    ok = _require_bool(chunk.ok, f"chunks[{index}].ok")
+    if ok:
+        _require_nonnegative_int(chunk.rows, f"chunks[{index}].rows")
         if chunk.error is not None:
             raise AcquisitionError(
                 f"chunks[{index}] is ok=True but carries an error message "
                 f"({chunk.error!r}); a successful chunk must have error=None."
             )
     else:
-        if chunk.rows != 0:
+        rows = _require_nonnegative_int(chunk.rows, f"chunks[{index}].rows")
+        if rows != 0:
             raise AcquisitionError(
                 f"chunks[{index}] failed (ok=False) but rows is {chunk.rows}, "
                 "expected 0."
@@ -177,16 +209,9 @@ def validate_fetch_evidence(fetch: FetchReportSnapshot) -> None:
                 f"{this_start.isoformat()}, expected {expected_start.isoformat()}."
             )
 
-    if fetch.total_rows < 0:
-        raise AcquisitionError(f"total_rows must be >= 0, got {fetch.total_rows}.")
-    if fetch.duplicate_rows_removed < 0:
-        raise AcquisitionError(
-            f"duplicate_rows_removed must be >= 0, got {fetch.duplicate_rows_removed}."
-        )
-    if fetch.conflicting_timestamps < 0:
-        raise AcquisitionError(
-            f"conflicting_timestamps must be >= 0, got {fetch.conflicting_timestamps}."
-        )
+    _require_nonnegative_int(fetch.total_rows, "total_rows")
+    _require_nonnegative_int(fetch.duplicate_rows_removed, "duplicate_rows_removed")
+    _require_nonnegative_int(fetch.conflicting_timestamps, "conflicting_timestamps")
 
     successful_rows = sum(c.rows for c in fetch.chunks if c.ok)
     expected_total = successful_rows - fetch.duplicate_rows_removed
@@ -266,6 +291,11 @@ def classify_acquisition_status(
     """
     if fetch is None:
         return AcquisitionRequestStatus.REQUESTS_UNKNOWN
+    if not isinstance(fetch, FetchReportSnapshot):
+        raise AcquisitionError(
+            f"fetch must be an actual FetchReportSnapshot or None, got "
+            f"{type(fetch).__name__}"
+        )
     all_ok = all(c.ok for c in fetch.chunks)
     any_ok = any(c.ok for c in fetch.chunks)
     if not any_ok:

@@ -404,3 +404,129 @@ def test_jan1_to_dec31_span_is_365():
     fetch = _fetch_for(ds, requested_from="2026-01-01", requested_to="2026-12-31")
     cmp = compute_requested_window_comparison(ds, fetch)
     assert cmp.requested_span_days == 365
+
+
+# ---------------------------------------------------------------------------
+# Strict field-type enforcement (Unit 9 hardening)
+#
+# Dataclasses do not enforce their type annotations. Every malformed value
+# below must be rejected as AcquisitionError -- never accepted, and never
+# surfaced as a raw TypeError.
+# ---------------------------------------------------------------------------
+
+
+def _one_day_fetch(**overrides) -> FetchReportSnapshot:
+    fields = dict(
+        symbol="NIFTY",
+        resolution="1",
+        requested_from="2026-01-01",
+        requested_to="2026-01-01",
+        chunks=(ChunkResultSnapshot("2026-01-01", "2026-01-01", 5, True, None),),
+        total_rows=5,
+        first_ts="x",
+        last_ts="y",
+        duplicate_rows_removed=0,
+        conflicting_timestamps=0,
+    )
+    fields.update(overrides)
+    return FetchReportSnapshot(**fields)
+
+
+def test_chunk_ok_as_truthy_string_rejected():
+    fetch = _one_day_fetch(
+        chunks=(ChunkResultSnapshot("2026-01-01", "2026-01-01", 5, "false", None),)
+    )
+    with pytest.raises(AcquisitionError):
+        validate_fetch_evidence(fetch)
+
+
+def test_chunk_ok_as_int_rejected():
+    fetch = _one_day_fetch(
+        chunks=(ChunkResultSnapshot("2026-01-01", "2026-01-01", 5, 1, None),)
+    )
+    with pytest.raises(AcquisitionError):
+        validate_fetch_evidence(fetch)
+
+
+def test_chunk_rows_as_bool_rejected():
+    fetch = _one_day_fetch(
+        chunks=(ChunkResultSnapshot("2026-01-01", "2026-01-01", True, True, None),),
+        total_rows=True,
+    )
+    with pytest.raises(AcquisitionError):
+        validate_fetch_evidence(fetch)
+
+
+def test_chunk_rows_as_float_rejected():
+    fetch = _one_day_fetch(
+        chunks=(ChunkResultSnapshot("2026-01-01", "2026-01-01", 1.5, True, None),),
+        total_rows=1.5,
+    )
+    with pytest.raises(AcquisitionError):
+        validate_fetch_evidence(fetch)
+
+
+def test_total_rows_as_bool_rejected():
+    fetch = _one_day_fetch(total_rows=True)
+    with pytest.raises(AcquisitionError):
+        validate_fetch_evidence(fetch)
+
+
+def test_total_rows_as_float_rejected():
+    fetch = _one_day_fetch(total_rows=5.0)
+    with pytest.raises(AcquisitionError):
+        validate_fetch_evidence(fetch)
+
+
+def test_duplicate_rows_removed_as_bool_rejected():
+    fetch = _one_day_fetch(duplicate_rows_removed=True)
+    with pytest.raises(AcquisitionError):
+        validate_fetch_evidence(fetch)
+
+
+def test_duplicate_rows_removed_as_float_rejected():
+    fetch = _one_day_fetch(duplicate_rows_removed=1.2)
+    with pytest.raises(AcquisitionError):
+        validate_fetch_evidence(fetch)
+
+
+def test_conflicting_timestamps_as_bool_rejected():
+    fetch = _one_day_fetch(conflicting_timestamps=True)
+    with pytest.raises(AcquisitionError):
+        validate_fetch_evidence(fetch)
+
+
+def test_conflicting_timestamps_as_string_rejected():
+    fetch = _one_day_fetch(conflicting_timestamps="0")
+    with pytest.raises(AcquisitionError):
+        validate_fetch_evidence(fetch)
+
+
+def test_failed_chunk_rows_as_bool_rejected():
+    # ok=False, rows=False -- False == 0 numerically, but must still be
+    # rejected for not being an actual int.
+    fetch = _one_day_fetch(
+        chunks=(ChunkResultSnapshot("2026-01-01", "2026-01-01", False, False, "boom"),),
+        total_rows=0,
+    )
+    with pytest.raises(AcquisitionError):
+        validate_fetch_evidence(fetch)
+
+
+def test_malformed_evidence_cannot_produce_requests_succeeded():
+    malformed = _one_day_fetch(total_rows=True)
+    with pytest.raises(AcquisitionError):
+        validate_fetch_evidence(malformed)
+    # classify_acquisition_status() assumes pre-validated evidence and does
+    # not itself repeat every check -- but the calling contract (validate
+    # first) prevents this malformed evidence from ever reaching it as
+    # "validated". Confirm that path is enforced: validation raises before
+    # classification is trusted to run in generation_store's own call order.
+    with pytest.raises(AcquisitionError):
+        validate_fetch_evidence(malformed)
+        classify_acquisition_status(malformed)  # unreachable if validate raises
+
+
+def test_classify_acquisition_status_rejects_non_snapshot_type():
+    with pytest.raises(AcquisitionError):
+        classify_acquisition_status("not a snapshot")  # type: ignore[arg-type]
