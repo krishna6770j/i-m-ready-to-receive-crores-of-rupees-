@@ -8,9 +8,10 @@ strategy in this repository has been shown to be profitable.**
 
 | | |
 |---|---|
-| **Phase** | 1 complete (data foundation) — awaiting manager review |
+| **Phase** | 1 data foundation — remediated after audit, awaiting manager review |
+| **FYERS adapter** | Verified against SDK source and mocks only — **no live call ever made** |
 | **Trading mode** | `paper` by default; `live` is refused at config load |
-| **Order placement** | Does not exist in this codebase |
+| **Order placement** | No call site, no endpoint defined; see Design rules |
 | **Execution instrument** | **Not selected.** Multiple candidates held for evaluation |
 | **Strategy** | Not implemented. No parameters tuned. No profitability claimed |
 | **Real market data** | **Not yet downloaded** — requires FYERS credentials |
@@ -107,22 +108,55 @@ been selected; `instruments/registry.py` holds unverified candidates only.
 
 **The validator flags, it never repairs.** Silent repair is how corrupt data
 reaches a backtest and produces a plausible wrong answer. Gap filling,
-interpolation and outlier smoothing are deliberately not implemented.
-`marketdata/cleaner.py` applies only explicitly requested, logged operations,
-and its default path changes nothing.
+interpolation and outlier smoothing are not implemented. `marketdata/cleaner.py`
+applies only explicitly requested, logged operations, and its default path
+changes no value.
+
+**Normalisation preserves every market value.** `normalise()` may reorder
+columns, convert dtypes losslessly, convert timezone preserving the instant,
+and sort. It may not substitute, fabricate, or drop. Missing volume stays
+missing (nullable `Int64`) rather than becoming `0`, which would assert that no
+trading occurred. A value present in the source but unparseable raises
+`SchemaError` naming it, instead of being coerced to `NaN` where it would be
+indistinguishable from genuine missingness.
+
+**Invalid data cannot become authoritative.** `store.write()` takes a required
+validation report and refuses to persist a dataset with ERROR-severity defects,
+or one whose acquisition had failed chunks. `force=True` permits an explicit
+override and is recorded permanently; a forced dataset is never
+`is_authoritative`. The manifest distinguishes complete+valid, complete+invalid,
+partial+valid and partial+invalid.
+
+**Gaps are measured, not assumed.** No trading calendar is configured, so the
+validator cannot tell a weekend from missing data. Rather than calling every
+cross-day gap expected, it reports the gap's span as a warning, escalates past
+an optional `max_session_gap_days`, and treats anything beyond 30 days as an
+error since no equity market closes that long.
 
 **Timestamps are tz-aware IST everywhere.** Naive timestamps are rejected, not
 localised by assumption. A candle's timestamp is its OPEN time, matching the
 FYERS convention.
 
-**Every dataset carries provenance.** Source, fetch time, requested range and a
-content hash live in a `.manifest.json` beside the Parquet file. Data without a
-manifest is refused on read.
+**Every dataset carries provenance.** Source, fetch time, requested range,
+validation status, acquisition status and a content hash live in a
+`.manifest.json` beside the Parquet file. Data without a manifest is refused on
+read, and `is_authoritative` is recomputed on read so an edited manifest cannot
+forge it.
 
-**Read-only by construction.** `ReadOnlyFyersClient` exposes an allowlist of
-four data methods. Any order-related attribute raises
-`OrderPlacementBlockedError`. A test parses the AST of every source file to
-assert no order-placement call exists anywhere.
+**Read-only surface.** `ReadOnlyFyersClient` exposes exactly four data methods
+and does **not** store the SDK object; each call is a closure, and `__slots__`
+removes the instance dict, so `client._inner`, `vars(client)` and `dir(client)`
+cannot reach an order-capable object. Order-shaped attribute names raise
+`OrderPlacementBlockedError`. An AST test fails the suite if any order-placement
+call is added to any source file.
+
+Stated precisely, because the distinction matters: **the FYERS SDK object that
+this project constructs does have order methods.** No order call site exists in
+this codebase and no order endpoint is defined in `brokers/fyers/endpoints.py`,
+but Python offers no true object containment — closure introspection can still
+reach the SDK. The wrapper removes accidental reach and makes deliberate reach
+obvious in review. It is not a sandbox, and this project should not be described
+as incapable of placing an order.
 
 ## Layout
 
@@ -131,9 +165,10 @@ config/       settings (mode + credentials) and instrument definitions
 core/         timezone handling, shared enums, redacting logger
 instruments/  signal/execution separation and the candidate registry
 marketdata/   schema, validator, cleaner, Parquet store, download orchestration
-brokers/      abstract read-only interface + verified FYERS adapter
+brokers/      read-only interface + FYERS adapter (SDK-source verified,
+              mock-tested; never yet run against the live service)
 scripts/      CLI entry points
-tests/        123 tests covering the above
+tests/        176 tests covering the above
 ```
 
 ## Regulatory note
