@@ -562,7 +562,6 @@ def test_registry_retains_rotated_out_secret():
     reg = SecretRegistry()
     reg.register("secret_A")
     reg.register("secret_B")
-    assert "secret_A" in reg.scrub("still has secret_A in it") or True
     scrubbed_a = reg.scrub("old value secret_A")
     scrubbed_b = reg.scrub("new value secret_B")
     assert "secret_A" not in scrubbed_a
@@ -1189,3 +1188,171 @@ def test_historical_crlf_and_unregistered_secret_in_message_does_not_escape():
     assert "NEVER_REGISTERED_CRLF_SECRET" not in text
     assert "\r" not in text
     assert "\n" not in text
+
+
+# ---------------------------------------------------------------------------
+# Unit 14 final redaction correction: top-level string code sanitization,
+# deterministic overlapping-secret redaction, and correct scrub/normalize
+# ordering for multiline registered secrets.
+# ---------------------------------------------------------------------------
+
+
+def test_registered_secret_as_top_level_code_not_in_repr():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+    from core.secrets import register as register_secret
+
+    register_secret("TOPLEVEL_CODE_REPR_SECRET_0010")
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR,
+        code="TOPLEVEL_CODE_REPR_SECRET_0010",
+        sanitized_message="generic error",
+    )
+    assert "TOPLEVEL_CODE_REPR_SECRET_0010" not in repr(diag)
+
+
+def test_registered_secret_as_top_level_code_not_in_broker_error_str():
+    from brokers.base import BrokerDataError
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+    from core.secrets import register as register_secret
+
+    register_secret("TOPLEVEL_CODE_STR_SECRET_0011")
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR,
+        code="TOPLEVEL_CODE_STR_SECRET_0011",
+        sanitized_message="generic error",
+    )
+    exc = BrokerDataError(diag)
+    assert "TOPLEVEL_CODE_STR_SECRET_0011" not in str(exc)
+    assert "TOPLEVEL_CODE_STR_SECRET_0011" not in repr(exc)
+
+
+def test_top_level_code_with_control_chars_becomes_safe_single_line():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR,
+        code="err\ncode\ttabbed",
+        sanitized_message="generic error",
+    )
+    assert "\n" not in diag.code
+    assert "\t" not in diag.code
+    assert len(diag.code.splitlines()) == 1
+
+
+def test_ordinary_numeric_code_is_unchanged():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR,
+        code=-16,
+        sanitized_message="generic error",
+    )
+    assert diag.code == -16
+
+
+def test_none_code_is_unchanged():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR,
+        code=None,
+        sanitized_message="generic error",
+    )
+    assert diag.code is None
+
+
+def test_overlapping_secrets_shorter_registered_first():
+    from core.secrets import SecretRegistry
+
+    reg = SecretRegistry()
+    reg.register("a")
+    reg.register("abc")
+    assert reg.scrub("abc") == "***REDACTED***"
+
+
+def test_overlapping_secrets_longer_registered_first():
+    from core.secrets import SecretRegistry
+
+    reg = SecretRegistry()
+    reg.register("abc")
+    reg.register("a")
+    assert reg.scrub("abc") == "***REDACTED***"
+
+
+def test_overlapping_token_prefix_secrets_fully_redacted():
+    from core.secrets import SecretRegistry
+
+    reg = SecretRegistry()
+    reg.register("token123")
+    reg.register("token")
+    assert reg.scrub("value=token123") == "value=***REDACTED***"
+
+
+def test_overlapping_secret_redaction_is_order_independent():
+    from core.secrets import SecretRegistry
+
+    reg_forward = SecretRegistry()
+    reg_forward.register("token")
+    reg_forward.register("token123")
+
+    reg_reversed = SecretRegistry()
+    reg_reversed.register("token123")
+    reg_reversed.register("token")
+
+    assert reg_forward.scrub("value=token123") == reg_reversed.scrub(
+        "value=token123"
+    )
+
+
+def test_overlapping_secret_redaction_is_repeatable():
+    from core.secrets import SecretRegistry
+
+    reg = SecretRegistry()
+    reg.register("a")
+    reg.register("abc")
+    first = reg.scrub("abc")
+    second = reg.scrub("abc")
+    assert first == second == "***REDACTED***"
+
+
+def test_rotated_overlapping_secrets_both_still_redact():
+    from core.secrets import SecretRegistry
+
+    reg = SecretRegistry()
+    reg.register("tok")
+    reg.register("tok_rotated_longer")
+    scrubbed_old = reg.scrub("using tok now")
+    scrubbed_new = reg.scrub("using tok_rotated_longer now")
+    assert "tok" not in scrubbed_old.replace("***REDACTED***", "")
+    assert "tok_rotated_longer" not in scrubbed_new
+
+
+def test_multiline_registered_secret_in_diagnostic_is_fully_redacted():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+    from core.secrets import REDACTED, register as register_secret
+
+    register_secret("multi\nline\nsecret_0012")
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR,
+        code=None,
+        sanitized_message="failure multi\nline\nsecret_0012",
+    )
+    assert "multi" not in diag.sanitized_message
+    assert "secret_0012" not in diag.sanitized_message
+    assert REDACTED in diag.sanitized_message
+    assert len(diag.sanitized_message.splitlines()) == 1
+
+
+def test_tab_and_cr_registered_secret_in_diagnostic_is_fully_redacted():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+    from core.secrets import REDACTED, register as register_secret
+
+    register_secret("tab\tand\rcr_secret_0013")
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR,
+        code=None,
+        sanitized_message="failure tab\tand\rcr_secret_0013 end",
+    )
+    assert "cr_secret_0013" not in diag.sanitized_message
+    assert REDACTED in diag.sanitized_message
+    assert len(diag.sanitized_message.splitlines()) == 1

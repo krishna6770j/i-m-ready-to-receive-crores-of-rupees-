@@ -66,8 +66,16 @@ class SecretRegistry:
         self._secrets.add(secret)
 
     def scrub(self, text: str) -> str:
-        """Replace every registered literal appearing in ``text``."""
-        for secret in self._secrets:
+        """Replace every registered literal appearing in ``text``.
+
+        Processes literals LONGEST FIRST (ties broken alphabetically, for a
+        deterministic order independent of registration order or Python's
+        set iteration order). Without this, a shorter registered secret that
+        happens to be a substring of a longer one -- e.g. "a" and "abc" both
+        registered -- can redact the "a" inside "abc" first, leaving "bc"
+        exposed and never matching the (now-broken) "abc" literal at all.
+        """
+        for secret in sorted(self._secrets, key=lambda s: (-len(s), s)):
             if secret in text:
                 text = text.replace(secret, REDACTED)
         return text

@@ -65,6 +65,20 @@ class BrokerDiagnosticStatus(str, Enum):
 
 
 def _sanitize_text(text: str) -> str:
+    """Scrub, THEN normalize, THEN scrub again.
+
+    A registered secret can itself contain control characters (a multiline
+    or tab/CR-containing token). Normalizing control characters to spaces
+    first would mangle that literal before ``scrub()`` ever sees it, so the
+    exact registered string no longer appears in the text and never matches
+    -- the secret leaks in plain sight. Scrubbing first catches the exact
+    literal while it's still intact. The second scrub afterwards is defence
+    in depth: it catches anything that only became a registered-secret match
+    as a side effect of normalization (e.g. a secret that was split across a
+    control character and became contiguous once that character turned into
+    a space).
+    """
+    text = scrub(text)
     text = _CONTROL_CHARS.sub(" ", text)
     text = _WHITESPACE_RUN.sub(" ", text).strip()
     text = scrub(text)
@@ -146,9 +160,14 @@ class BrokerDiagnostic:
                 "status must be a BrokerDiagnosticStatus, got "
                 f"{type(self.status).__name__}"
             )
-        object.__setattr__(
-            self, "code", _validate_code(self.code, where="code")
-        )
+        validated_code = _validate_code(self.code, where="code")
+        if isinstance(validated_code, str):
+            # A str code is free text from the same untrusted source as the
+            # message, and __repr__ renders it -- it must be scrubbed and
+            # normalized exactly like sanitized_message, or a registered
+            # secret passed as `code=` would leak straight through repr().
+            validated_code = _sanitize_text(validated_code)
+        object.__setattr__(self, "code", validated_code)
         if not isinstance(self.sanitized_message, str):
             raise TypeError(
                 "sanitized_message must be a str, got "
