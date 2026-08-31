@@ -15,6 +15,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from enum import Enum
 
 import pandas as pd
 
@@ -101,6 +102,79 @@ class FetchReport:
                 for c in self.chunks
             ],
         }
+
+
+class ProbeWindowStatus(str, Enum):
+    """Classification of one probed window's OUTCOME, never a claim about
+    what lies outside the window.
+
+    - ``DATA``: the request completed successfully and returned >= 1 candle.
+    - ``EMPTY_SUCCESS``: the request completed successfully and returned
+      zero candles. This is a genuine observation (e.g. a holiday, or a
+      period truly outside served history) -- but on its own it proves
+      nothing about windows on either side of it.
+    - ``ERROR``: the broker/data/rate-limit request failed. This is
+      UNRESOLVED evidence, not evidence of absence -- it must never be
+      treated as equivalent to ``EMPTY_SUCCESS``.
+    - ``UNKNOWN``: the window was never successfully resolved/probed at all
+      (reserved for future callers that construct a report without probing
+      every window; the scan in this module always resolves every window it
+      visits to one of the other three statuses).
+    """
+
+    DATA = "DATA"
+    EMPTY_SUCCESS = "EMPTY_SUCCESS"
+    ERROR = "ERROR"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class ProbeWindow:
+    """One probed window's outcome. Immutable -- a probe result must not be
+    edited after the fact.
+    """
+
+    range_from: str
+    range_to: str
+    status: ProbeWindowStatus
+    row_count: int
+    earliest_ts: str | None = None
+    latest_ts: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class HistoryDepthProbeReport:
+    """Result of :meth:`FyersHistoricalData.probe_history_depth`.
+
+    This is an OBSERVATION report, not a retention/availability
+    certification. See :meth:`FyersHistoricalData.probe_history_depth`'s
+    docstring for exactly what it does and does not establish.
+
+    ``oldest_contiguous_empty_success_interval``: the oldest contiguous run
+    of adjacent ``EMPTY_SUCCESS`` coarse windows directly older than
+    (adjacent to) ``oldest_data_window``, if one exists -- narrowly an
+    observed fact about probed windows, NEVER proof of no earlier data, a
+    retention boundary, or a trading-calendar gap certification. Empty if
+    no such run exists (including when ``oldest_data_window`` is ``None``).
+
+    ``unresolved_intervals``: every probed window (coarse or subdivision)
+    that came back ``ERROR`` or ``UNKNOWN`` -- evidence this scan could not
+    resolve, never silently treated as absence.
+    """
+
+    symbol: str
+    resolution: str
+    search_horizon_start: str
+    search_horizon_end: str
+    coarse_window_days: int
+    subdivision_resolution_days: int
+    windows: tuple[ProbeWindow, ...]
+    earliest_observed_candle: str | None
+    earliest_observed_date: str | None
+    oldest_data_window: ProbeWindow | None
+    oldest_contiguous_empty_success_interval: tuple[ProbeWindow, ...]
+    unresolved_intervals: tuple[ProbeWindow, ...]
 
 
 class FyersHistoricalData(HistoricalDataProvider):
@@ -288,6 +362,262 @@ class FyersHistoricalData(HistoricalDataProvider):
         frame, _ = self.fetch_candles_with_report(symbol, resolution, start, end)
         return frame
 
+    def probe_history_depth(
+        self,
+        symbol: str,
+        resolution: str,
+        *,
+        newest: date,
+        oldest_to_try: date,
+        coarse_window_days: int = 5,
+        subdivision_resolution_days: int = 1,
+    ) -> "HistoryDepthProbeReport":
+        """Bounded backward-window scan of OBSERVED history.
+
+        This method establishes, at most, two facts:
+
+            A. the earliest candle actually observed within the probed horizon
+            B. the earliest calendar date (IST) that candle falls on
+
+        It does NOT and CANNOT establish a broker "retention boundary", a
+        continuous-history boundary (that needs a trading calendar, which
+        this method does not have), or that no data exists before/inside the
+        horizon that this scan simply never asked about. If nothing was
+        observed, ``earliest_observed_candle``/``earliest_observed_date`` are
+        ``None`` -- that is silence, not proof of absence.
+
+        Replaces the previous binary search, which assumed "did this narrow
+        window return data?" was a MONOTONIC predicate across the horizon
+        (i.e. that once you cross from "no data" to "data" walking backward
+        in time, you never cross back). That assumption is false: a single
+        holiday-shaped empty window between two windows that both have data
+        makes a binary search converge on the WRONG boundary, silently
+        skipping genuine older data on the other side of the gap. This
+        method instead probes every coarse window in the horizon and never
+        infers through an unresolved (ERROR) or empty result.
+
+        Algorithm:
+
+        1. Walk backward from ``newest`` in non-overlapping
+           ``coarse_window_days``-sized windows down to ``oldest_to_try``
+           (the last window is clipped to ``oldest_to_try``), probing every
+           one -- never stopping early on an EMPTY_SUCCESS or ERROR result.
+        2. Find the OLDEST coarse window classified DATA (if any). Only that
+           one window is subdivided -- EMPTY_SUCCESS/ERROR windows are never
+           subdivided, since neither proves anything about the data (or lack
+           of it) inside them at finer granularity.
+        3. Subdivide that window, backward, into non-overlapping
+           ``subdivision_resolution_days``-sized windows, probing every one,
+           to tighten the bracket around the earliest OBSERVED candle. The
+           final ``earliest_observed_candle``/``earliest_observed_date`` are
+           read from actual returned candle timestamps, never a requested
+           window's start date.
+
+        ``BrokerAuthError`` propagates immediately and aborts the whole scan
+        (never downgraded to ERROR/EMPTY -- an expired token is not evidence
+        about history depth). ``BrokerRateLimitError``/``BrokerDataError``
+        become ``ProbeWindowStatus.ERROR`` windows and the scan continues.
+        Any other exception propagates unchanged.
+        """
+        self._validate_resolution(resolution)
+        if oldest_to_try > newest:
+            raise ValueError(
+                f"oldest_to_try ({oldest_to_try}) must be <= newest ({newest})."
+            )
+        if coarse_window_days <= 0:
+            raise ValueError(
+                f"coarse_window_days must be positive, got {coarse_window_days}."
+            )
+        if subdivision_resolution_days <= 0:
+            raise ValueError(
+                "subdivision_resolution_days must be positive, got "
+                f"{subdivision_resolution_days}."
+            )
+        if subdivision_resolution_days > coarse_window_days:
+            raise ValueError(
+                f"subdivision_resolution_days ({subdivision_resolution_days}) "
+                f"must be <= coarse_window_days ({coarse_window_days})."
+            )
+
+        first_request = True
+
+        # --- 1. coarse backward scan, newest -> oldest, non-overlapping ---
+        coarse_windows: list[ProbeWindow] = []
+        window_end = newest
+        while window_end >= oldest_to_try:
+            window_start = max(
+                window_end - timedelta(days=coarse_window_days - 1), oldest_to_try
+            )
+            probe_window, first_request = self._probe_one_window(
+                symbol, resolution, window_start, window_end, first_request
+            )
+            coarse_windows.append(probe_window)
+            window_end = window_start - timedelta(days=1)
+
+        # --- 2. locate the OLDEST coarse window classified DATA -----------
+        # coarse_windows is ordered newest -> oldest; the LAST DATA entry in
+        # that order is the topologically oldest one.
+        oldest_data_index: int | None = None
+        for index, probed in enumerate(coarse_windows):
+            if probed.status is ProbeWindowStatus.DATA:
+                oldest_data_index = index
+        oldest_data_window = (
+            coarse_windows[oldest_data_index] if oldest_data_index is not None else None
+        )
+
+        # Contiguous EMPTY_SUCCESS run directly older than (adjacent to) the
+        # oldest DATA window -- an observed fact only, never a retention or
+        # trading-calendar claim. If oldest_data_window is None, or the
+        # window immediately older is not EMPTY_SUCCESS, this is empty.
+        empty_run: list[ProbeWindow] = []
+        if oldest_data_index is not None:
+            cursor = oldest_data_index + 1
+            while (
+                cursor < len(coarse_windows)
+                and coarse_windows[cursor].status is ProbeWindowStatus.EMPTY_SUCCESS
+            ):
+                empty_run.append(coarse_windows[cursor])
+                cursor += 1
+
+        # --- 3. subdivide ONLY the oldest DATA window ---------------------
+        subdivision_windows: list[ProbeWindow] = []
+        if oldest_data_window is not None:
+            subdivision_windows, first_request = self._subdivide_window(
+                symbol,
+                resolution,
+                oldest_data_window,
+                subdivision_resolution_days,
+                first_request,
+            )
+
+        all_windows = tuple(coarse_windows) + tuple(subdivision_windows)
+
+        # Earliest observed candle: prefer the finer subdivision evidence;
+        # fall back to the coarse DATA window's own already-real candle
+        # timestamp if subdivision produced no DATA window itself (e.g. the
+        # sub-window actually containing the earliest candle came back
+        # ERROR). Both sources are genuine returned-candle timestamps, never
+        # a requested window's start date.
+        data_candidates = [w for w in subdivision_windows if w.status is ProbeWindowStatus.DATA]
+        if not data_candidates and oldest_data_window is not None:
+            data_candidates = [oldest_data_window]
+
+        earliest_observed_candle: str | None = None
+        if data_candidates:
+            earliest_observed_candle = min(
+                w.earliest_ts for w in data_candidates if w.earliest_ts is not None
+            )
+        earliest_observed_date = (
+            earliest_observed_candle[:10] if earliest_observed_candle is not None else None
+        )
+
+        unresolved_intervals = tuple(
+            w for w in all_windows
+            if w.status in (ProbeWindowStatus.ERROR, ProbeWindowStatus.UNKNOWN)
+        )
+
+        return HistoryDepthProbeReport(
+            symbol=symbol,
+            resolution=resolution,
+            search_horizon_start=to_api_date(oldest_to_try),
+            search_horizon_end=to_api_date(newest),
+            coarse_window_days=coarse_window_days,
+            subdivision_resolution_days=subdivision_resolution_days,
+            windows=all_windows,
+            earliest_observed_candle=earliest_observed_candle,
+            earliest_observed_date=earliest_observed_date,
+            oldest_data_window=oldest_data_window,
+            oldest_contiguous_empty_success_interval=tuple(empty_run),
+            unresolved_intervals=unresolved_intervals,
+        )
+
+    def _probe_one_window(
+        self,
+        symbol: str,
+        resolution: str,
+        start: date,
+        end: date,
+        first_request: bool,
+    ) -> tuple["ProbeWindow", bool]:
+        """Probe one window, classify it, and report whether a request was
+        actually made (so the caller can track ``first_request`` for pause
+        timing across the whole scan, coarse + subdivision combined).
+        """
+        if not first_request and self._pause:
+            time.sleep(self._pause)
+        try:
+            frame = self.fetch_chunk(symbol, resolution, start, end)
+        except BrokerAuthError:
+            # Never downgraded: an expired/invalid token tells us nothing
+            # about history depth and must abort the whole scan.
+            raise
+        except (BrokerDataError, BrokerRateLimitError) as exc:
+            logger.warning("probe %s..%s failed: %s", start, end, exc)
+            return (
+                ProbeWindow(
+                    range_from=to_api_date(start),
+                    range_to=to_api_date(end),
+                    status=ProbeWindowStatus.ERROR,
+                    row_count=0,
+                    error=str(exc),
+                ),
+                False,
+            )
+
+        row_count = len(frame)
+        if row_count == 0:
+            return (
+                ProbeWindow(
+                    range_from=to_api_date(start),
+                    range_to=to_api_date(end),
+                    status=ProbeWindowStatus.EMPTY_SUCCESS,
+                    row_count=0,
+                ),
+                False,
+            )
+        return (
+            ProbeWindow(
+                range_from=to_api_date(start),
+                range_to=to_api_date(end),
+                status=ProbeWindowStatus.DATA,
+                row_count=row_count,
+                earliest_ts=frame[TS].iloc[0].isoformat(),
+                latest_ts=frame[TS].iloc[-1].isoformat(),
+            ),
+            False,
+        )
+
+    def _subdivide_window(
+        self,
+        symbol: str,
+        resolution: str,
+        coarse_window: "ProbeWindow",
+        subdivision_resolution_days: int,
+        first_request: bool,
+    ) -> tuple[list["ProbeWindow"], bool]:
+        """Backward, non-overlapping subdivision of exactly one DATA window,
+        strictly within its own bounds, probing every sub-window (never
+        stopping early) to tighten the bracket around the earliest observed
+        candle.
+        """
+        window_start_bound = date.fromisoformat(coarse_window.range_from)
+        window_end_bound = date.fromisoformat(coarse_window.range_to)
+
+        sub_windows: list[ProbeWindow] = []
+        cursor_end = window_end_bound
+        while cursor_end >= window_start_bound:
+            cursor_start = max(
+                cursor_end - timedelta(days=subdivision_resolution_days - 1),
+                window_start_bound,
+            )
+            probe_window, first_request = self._probe_one_window(
+                symbol, resolution, cursor_start, cursor_end, first_request
+            )
+            sub_windows.append(probe_window)
+            cursor_end = cursor_start - timedelta(days=1)
+
+        return sub_windows, first_request
+
     def probe_earliest_available(
         self,
         symbol: str,
@@ -297,33 +627,26 @@ class FyersHistoricalData(HistoricalDataProvider):
         oldest_to_try: date,
         probe_window_days: int = 5,
     ) -> date | None:
-        """Binary-search the earliest date that returns candles.
+        """DEPRECATED: use :meth:`probe_history_depth` instead.
 
-        Manager correction #12: do not assume a history depth. This determines
-        empirically how far back the vendor actually serves data, using a small
-        number of narrow probes rather than downloading everything first.
-
-        Returns the start of the earliest probe window that produced data, or
-        None if no window in the range did.
+        This name and its previous binary-search implementation incorrectly
+        implied a certified "availability"/retention boundary, and the
+        binary search itself silently mishandled non-monotonic evidence
+        (a holiday-shaped empty window between two windows that both have
+        data). This wrapper now delegates to :meth:`probe_history_depth` and
+        returns ONLY ``earliest_observed_date`` (or ``None``) -- an
+        OBSERVATION from the bounded backward scan, never a broker retention
+        claim. Kept solely for ``scripts/download_data.py``'s existing call
+        site; do not add new callers -- call :meth:`probe_history_depth`
+        directly and use its structured report instead.
         """
-        self._validate_resolution(resolution)
-        lo, hi = oldest_to_try, newest
-        earliest_hit: date | None = None
-
-        while lo <= hi:
-            mid = lo + (hi - lo) // 2
-            window_end = min(mid + timedelta(days=probe_window_days - 1), newest)
-            try:
-                got = len(self.fetch_chunk(symbol, resolution, mid, window_end))
-            except (BrokerDataError, BrokerRateLimitError) as exc:
-                logger.warning("probe at %s failed: %s", mid, exc)
-                got = 0
-            if got > 0:
-                earliest_hit = mid
-                hi = mid - timedelta(days=1)
-            else:
-                lo = mid + timedelta(days=1)
-            if self._pause:
-                time.sleep(self._pause)
-
-        return earliest_hit
+        report = self.probe_history_depth(
+            symbol,
+            resolution,
+            newest=newest,
+            oldest_to_try=oldest_to_try,
+            coarse_window_days=probe_window_days,
+        )
+        if report.earliest_observed_date is None:
+            return None
+        return date.fromisoformat(report.earliest_observed_date)
