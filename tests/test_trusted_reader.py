@@ -18,7 +18,7 @@ from marketdata.evidence import ChunkResultSnapshot, FetchReportSnapshot
 from marketdata.generation_store import write_generation
 from marketdata.identity import DatasetIdentity
 from marketdata.locator import CurrentPointer, safe_slug
-from marketdata.provenance import Namespace, ProvenanceEnvelope
+from marketdata.provenance import Namespace, ProvenanceEnvelope, ReconstructedManifest
 from marketdata.schemas import CLOSE, HIGH, LOW, OPEN, TS, VOLUME
 from marketdata.trusted_reader import (
     TrustedReadError,
@@ -639,3 +639,54 @@ def test_trusted_reader_forced_defense_in_depth_isolated(tmp_path, monkeypatch):
     )
     with pytest.raises(TrustedReadError):
         read_trusted(tmp_path, source="fyers:history", symbol="NIFTY", resolution="1")
+
+
+# ---------------------------------------------------------------------------
+# Unit 10 final closure: trusted-read source_evidence.row_count cross-check
+# against a SELF-CONSISTENT forged manifest (digests recomputed to match the
+# tampered row_count, so ordinary digest checks all pass -- only the
+# dedicated row-count cross-check can catch this).
+# ---------------------------------------------------------------------------
+
+
+def test_self_consistent_forged_row_count_rejected(tmp_path):
+    ds, env, generation_dir = _write_trusted(tmp_path)
+    manifest_path = _manifest_path(tmp_path, ds.identity, env.generation_id)
+    current_path = _current_path(tmp_path, ds.identity)
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["source_evidence"]["row_count"] = payload["source_evidence"]["row_count"] + 1
+    forged_json = json.dumps(payload)
+
+    # Recompute provenance_digest/integrity_id from the TAMPERED fields, so
+    # the forged manifest is fully self-consistent -- every ordinary digest
+    # check (data_digest, provenance_digest, integrity_id, CURRENT pointer)
+    # passes. Only the dedicated source_evidence.row_count-vs-actual-frame
+    # cross-check can catch this.
+    forged_manifest = ReconstructedManifest.from_manifest_json(forged_json)
+    new_provenance_digest = forged_manifest.recompute_provenance_digest()
+    new_integrity_id = hashlib_sha256_of(payload["data_digest"], new_provenance_digest)
+    payload["provenance_digest"] = new_provenance_digest
+    payload["integrity_id"] = new_integrity_id
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    pointer = CurrentPointer(generation_id=env.generation_id, integrity_id=new_integrity_id)
+    current_path.write_text(pointer.to_json(), encoding="utf-8")
+
+    # Sanity: the forgery really is self-consistent up through the digest
+    # layer -- confirm recompute_integrity_id() on the rewritten manifest
+    # agrees with what we just wrote.
+    rewritten = ReconstructedManifest.from_manifest_json(manifest_path.read_text(encoding="utf-8"))
+    assert rewritten.recompute_provenance_digest() == rewritten.provenance_digest
+    assert rewritten.recompute_integrity_id() == rewritten.integrity_id
+
+    with pytest.raises(TrustedReadError, match="row_count"):
+        read_trusted(tmp_path, source="fyers:history", symbol="NIFTY", resolution="1")
+
+
+def hashlib_sha256_of(data_digest_hex: str, provenance_digest_hex: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(
+        bytes.fromhex(data_digest_hex) + bytes.fromhex(provenance_digest_hex)
+    ).hexdigest()

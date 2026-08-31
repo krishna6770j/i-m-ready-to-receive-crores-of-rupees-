@@ -109,6 +109,7 @@ from typing import Any
 from core.environment import software_versions
 from marketdata.dataset import ValidatedDataset, ValidationPolicy
 from marketdata.evidence import ChunkResultSnapshot, FetchReportSnapshot
+from marketdata.identity import DatasetIdentity, DatasetIdentityError
 from marketdata.schemas import (
     MARKET_DATA_SCHEMA_VERSION,
     AnomalySeverity,
@@ -858,6 +859,33 @@ def _manifest_require_str_or_none(value: object, field_name: str):
     return value
 
 
+def _require_canonical_manifest_identity(source: str, symbol: str, resolution: str) -> None:
+    """Restore ``DatasetIdentity``'s own construction invariants (str,
+    non-empty, no NUL, NFC-normalised) on the manifest's persisted
+    source/symbol/resolution -- ``ReconstructedManifest`` previously only
+    checked ``type(...) is str``, which allowed manifest identity states
+    ``ProvenanceEnvelope.build()`` could never have produced (empty string,
+    embedded NUL, non-NFC text).
+
+    Deliberately does NOT normalise the persisted value to make it pass --
+    a manifest's identity fields must ALREADY be canonical NFC, exactly as
+    ``DatasetIdentity.__post_init__`` would have left them at build time;
+    silently normalising here would accept a manifest whose bytes never
+    actually matched what ``build()`` wrote.
+    """
+    try:
+        identity = DatasetIdentity(source=source, symbol=symbol, resolution=resolution)
+    except DatasetIdentityError as exc:
+        raise ManifestError(f"manifest identity is invalid: {exc}") from exc
+    if identity.source != source or identity.symbol != symbol or identity.resolution != resolution:
+        raise ManifestError(
+            "manifest identity is not already NFC-normalised -- a "
+            "persisted manifest's source/symbol/resolution must already be "
+            "canonical NFC text, exactly as DatasetIdentity would have left "
+            "it at build time; this parser never normalises it for you."
+        )
+
+
 def _parse_transformation(payload: object, index: int) -> CanonicalisationTransformation:
     payload = _manifest_require_exact_keys(payload, _TRANSFORMATION_FIELDS, f"transformations[{index}]")
     code = _manifest_require_type(payload["code"], str, f"transformations[{index}].code")
@@ -901,6 +929,45 @@ def _parse_source_evidence(payload: object) -> SourceEvidence:
     ts_dupes = _manifest_require_nonneg_int(
         payload["duplicate_timestamp_row_count"], "source_evidence.duplicate_timestamp_row_count"
     )
+
+    # Basic invariants real canonicalisation output always satisfies (frozen
+    # architecture section 14/8.3) -- a manifest violating one of these is
+    # not a coherent SourceEvidence at all, regardless of whether its
+    # individual fields each pass their own type/non-negativity check.
+    # Deliberately does NOT invent any stronger claim that cannot be proven
+    # from these six fields alone (e.g. nothing here reconstructs actual
+    # source ordering or representation-level duplicates).
+    max_descents = max(row_count - 1, 0)
+    if descending > max_descents:
+        raise ManifestError(
+            f"source_evidence.descending_adjacent_pairs ({descending}) "
+            f"exceeds the maximum possible for row_count ({row_count}): "
+            f"{max_descents}."
+        )
+    if exact_dupes > row_count:
+        raise ManifestError(
+            f"source_evidence.exact_duplicate_row_count ({exact_dupes}) "
+            f"exceeds row_count ({row_count})."
+        )
+    if ts_dupes > row_count:
+        raise ManifestError(
+            f"source_evidence.duplicate_timestamp_row_count ({ts_dupes}) "
+            f"exceeds row_count ({row_count})."
+        )
+    if exact_dupes > ts_dupes:
+        raise ManifestError(
+            f"source_evidence.exact_duplicate_row_count ({exact_dupes}) "
+            f"exceeds duplicate_timestamp_row_count ({ts_dupes}) -- every "
+            "exact duplicate is necessarily also a duplicate timestamp."
+        )
+    if timestamps_sorted != (descending == 0):
+        raise ManifestError(
+            f"source_evidence.timestamps_sorted ({timestamps_sorted}) is "
+            f"inconsistent with descending_adjacent_pairs ({descending}): "
+            "timestamps_sorted must be True if and only if "
+            "descending_adjacent_pairs == 0."
+        )
+
     return SourceEvidence(
         row_count=row_count,
         column_inventory=tuple(column_inventory_raw),
@@ -1123,6 +1190,7 @@ class ReconstructedManifest:
         source = _manifest_require_type(payload["source"], str, "source")
         symbol = _manifest_require_type(payload["symbol"], str, "symbol")
         resolution = _manifest_require_type(payload["resolution"], str, "resolution")
+        _require_canonical_manifest_identity(source, symbol, resolution)
 
         generation_id_raw = payload["generation_id"]
         if type(generation_id_raw) is not str:

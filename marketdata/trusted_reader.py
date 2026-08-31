@@ -661,6 +661,21 @@ def read_trusted(root: Path, *, source: str, symbol: str, resolution: str) -> Tr
             f"match CURRENT pointer integrity_id ({pointer.integrity_id})."
         )
 
+    # Canonicalisation in schema v1 never drops rows, so the row count
+    # source_evidence recorded at build time must still equal the loaded
+    # canonical frame's row count. This is the ONLY source_evidence fact
+    # genuinely re-derivable from the final frame -- source ordering,
+    # representation-level duplicates, transformations, and anomalies are
+    # all facts about the ORIGINAL input that cannot be reconstructed from
+    # already-canonicalised data, and this check deliberately does not
+    # pretend otherwise.
+    if manifest.source_evidence.row_count != len(frame):
+        raise TrustedReadError(
+            f"manifest.source_evidence.row_count "
+            f"({manifest.source_evidence.row_count}) does not match the "
+            f"loaded canonical frame's row count ({len(frame)})."
+        )
+
     # Re-run validation using the STORED ValidationPolicy -- never trust a
     # validation RESULT from the manifest (there is none stored anyway).
     report = validate(

@@ -877,3 +877,105 @@ def test_forced_false_with_nonnull_force_reason_rejected():
     payload["force_reason"] = "not actually forced"
     with pytest.raises(ManifestError):
         ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+# ---------------------------------------------------------------------------
+# Unit 10 final closure: restored DatasetIdentity + SourceEvidence
+# invariants on reconstruction.
+# ---------------------------------------------------------------------------
+
+import unicodedata
+
+
+def test_empty_source_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["source"] = ""
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_empty_symbol_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["symbol"] = ""
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_empty_resolution_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["resolution"] = ""
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_nul_in_identity_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["source"] = "fyers\x00:history"
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_non_nfc_identity_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    decomposed = unicodedata.normalize("NFD", "café")
+    assert decomposed != unicodedata.normalize("NFC", decomposed)
+    payload["source"] = decomposed
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_descending_adjacent_pairs_exceeding_row_count_minus_one_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    row_count = payload["source_evidence"]["row_count"]
+    payload["source_evidence"]["descending_adjacent_pairs"] = row_count  # max is row_count - 1
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_exact_duplicate_row_count_exceeding_row_count_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["source_evidence"]["exact_duplicate_row_count"] = payload["source_evidence"]["row_count"] + 1
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_duplicate_timestamp_row_count_exceeding_row_count_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["source_evidence"]["duplicate_timestamp_row_count"] = payload["source_evidence"]["row_count"] + 1
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_exact_duplicate_exceeding_duplicate_timestamp_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["source_evidence"]["exact_duplicate_row_count"] = 2
+    payload["source_evidence"]["duplicate_timestamp_row_count"] = 1
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_timestamps_sorted_true_with_descents_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["source_evidence"]["timestamps_sorted"] = True
+    payload["source_evidence"]["descending_adjacent_pairs"] = 1
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
+
+
+def test_timestamps_sorted_false_with_no_descents_rejected():
+    _, manifest_json = _envelope_and_json()
+    payload = json.loads(manifest_json)
+    payload["source_evidence"]["timestamps_sorted"] = False
+    payload["source_evidence"]["descending_adjacent_pairs"] = 0
+    with pytest.raises(ManifestError):
+        ReconstructedManifest.from_manifest_json(json.dumps(payload))
