@@ -11,6 +11,8 @@
 # rather than filled with plausible guesses, so that code which needs them
 # fails loudly instead of silently computing with invented values.
 
+schema_version: 1
+
 signal_instruments:
   - symbol: "NSE:NIFTY50-INDEX"
     name: "NIFTY 50 Index"
