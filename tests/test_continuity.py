@@ -472,3 +472,50 @@ def test_valid_bar_protocol_violation_detected_even_when_session_day_false():
     frame = _frame_from_timestamps([_ts("2026-01-01 09:15")])
     with pytest.raises(TypeError, match="is_valid_bar"):
         certify_sessions(frame, "1", SessionDayFalseButValidBarBrokenCalendar())
+
+
+# ---------------------------------------------------------------------------
+# Empty-session overcertification fix: session certification is PER-CANDLE,
+# deliberately different from continuity's "<2 observations" rule.
+# ---------------------------------------------------------------------------
+
+
+def test_session_empty_frame_with_null_calendar_not_certified():
+    frame = _frame_from_timestamps([])
+    result = certify_sessions(frame, "1", NullCalendar())
+    assert result.status is CertificationStatus.NOT_CERTIFIED
+    assert result.checked_count == 0
+    assert result.invalid_timestamps == ()
+
+
+def test_session_empty_frame_with_configured_calendar_not_certified():
+    """The overcertification regression: zero candles means there is
+    nothing to check, so this must be NOT_CERTIFIED (insufficient
+    evidence) -- never vacuously CERTIFIED."""
+    frame = _frame_from_timestamps([])
+    result = certify_sessions(frame, "1", FakeCalendar())
+    assert result.status is CertificationStatus.NOT_CERTIFIED
+    assert result.checked_count == 0
+    assert result.invalid_timestamps == ()
+
+
+def test_session_one_valid_candle_with_configured_calendar_certified():
+    """Session certification is PER-CANDLE, deliberately unlike
+    continuity's "fewer than 2 observations" rule: a SINGLE candle is
+    already sufficient evidence to certify it."""
+    frame = _frame_from_timestamps([_ts("2026-01-01 09:15")])
+    result = certify_sessions(frame, "1", FakeCalendar())
+    assert result.status is CertificationStatus.CERTIFIED
+    assert result.checked_count == 1
+    assert result.invalid_timestamps == ()
+
+
+def test_session_one_invalid_candle_with_configured_calendar_failed():
+    """Symmetric to the CERTIFIED case: a single candle is also already
+    sufficient evidence to FAIL it, unlike continuity's insufficient-
+    evidence rule for < 2 observations."""
+    frame = _frame_from_timestamps([_ts("2026-01-01 16:00")])  # after close
+    result = certify_sessions(frame, "1", FakeCalendar())
+    assert result.status is CertificationStatus.FAILED
+    assert result.checked_count == 1
+    assert result.invalid_timestamps == ("2026-01-01T16:00:00+05:30",)

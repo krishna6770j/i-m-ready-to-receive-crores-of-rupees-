@@ -367,6 +367,15 @@ def certify_sessions(
     ``calendar.is_valid_bar(ts, resolution)``. Session validity is never
     inferred from ``is_session_day`` alone -- this is exactly why
     ``is_valid_bar`` exists on the protocol (see the module docstring).
+
+    With ZERO candles: ``NOT_CERTIFIED``, for BOTH ``NullCalendar`` and a
+    configured calendar -- an empty frame has no candle to check, so there
+    is insufficient evidence to certify (never ``FAILED``: nothing
+    contradicts anything). This is intentionally DIFFERENT from
+    ``certify_continuity``'s "fewer than 2 observations" rule: continuity
+    is about TRANSITIONS between observations (needs >= 2 candles), while
+    session certification is PER-CANDLE (one single candle is already
+    enough evidence to certify or fail it).
     """
     assert_canonical(frame)
     _require_resolution(resolution)
@@ -383,6 +392,15 @@ def certify_sessions(
 
     _require_calendar_shape(calendar)
     _require_calendar_identity(calendar)
+
+    if len(timestamps) == 0:
+        return SessionCertification(
+            status=CertificationStatus.NOT_CERTIFIED,
+            calendar_id=calendar.calendar_id,
+            calendar_version=calendar.calendar_version,
+            invalid_timestamps=(),
+            checked_count=0,
+        )
 
     invalid: list[str] = []
     for ts in timestamps:
