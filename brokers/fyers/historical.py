@@ -25,6 +25,7 @@ from brokers.base import (
     BrokerRateLimitError,
     HistoricalDataProvider,
 )
+from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
 from brokers.fyers import endpoints as ep
 from core.timeutils import to_api_date
 from core.types import Resolution
@@ -214,32 +215,84 @@ class FyersHistoricalData(HistoricalDataProvider):
             )
 
     def _parse_response(self, payload) -> pd.DataFrame:
-        """Turn a /history response into a canonical frame, or raise."""
+        """Turn a /history response into a canonical frame, or raise.
+
+        The raw payload/message exists only in this method's local scope, for
+        classification. Only the broker's ``status`` and ``code`` -- both
+        allowlisted, non-free-text fields -- ever leave it via a
+        BrokerDiagnostic; the raw message text itself is never logged,
+        stored, printed, or embedded in an exception.
+        """
         if not isinstance(payload, dict):
             raise BrokerDataError(
-                f"Expected a dict from /history, got {type(payload).__name__}."
+                BrokerDiagnostic(
+                    status=BrokerDiagnosticStatus.DATA_ERROR,
+                    code=None,
+                    sanitized_message=(
+                        f"Expected a dict from /history, got {type(payload).__name__}."
+                    ),
+                )
             )
 
         status = payload.get(ep.STATUS_KEY)
         if status != ep.STATUS_OK:
-            message = str(payload.get(ep.MESSAGE_KEY, "")).lower()
+            # Inspected in memory only, to classify the failure -- never
+            # copied into the diagnostic raised below.
+            raw_message = str(payload.get(ep.MESSAGE_KEY, "")).lower()
             code = payload.get("code")
-            detail = f"status={status!r} code={code!r} message={payload.get(ep.MESSAGE_KEY)!r}"
-            if "token" in message or "auth" in message or code in (-15, -16, -17):
+            is_auth = (
+                "token" in raw_message
+                or "auth" in raw_message
+                or code in (-15, -16, -17)
+            )
+            is_rate_limit = (
+                "rate" in raw_message
+                or "limit" in raw_message
+                or "too many" in raw_message
+            )
+            fields = {"status": status, "code": code}
+            if is_auth:
                 raise BrokerAuthError(
-                    f"FYERS rejected the request as unauthenticated ({detail}). "
-                    "The access token is short-lived and must be regenerated each "
-                    "trading day."
+                    BrokerDiagnostic(
+                        status=BrokerDiagnosticStatus.AUTH_ERROR,
+                        code=code,
+                        sanitized_message=(
+                            "FYERS rejected the request as unauthenticated. The "
+                            "access token is short-lived and must be regenerated "
+                            "each trading day."
+                        ),
+                        sanitized_structured_fields=fields,
+                    )
                 )
-            if "rate" in message or "limit" in message or "too many" in message:
-                raise BrokerRateLimitError(f"FYERS rate limit hit ({detail}).")
-            raise BrokerDataError(f"FYERS /history returned an error ({detail}).")
+            if is_rate_limit:
+                raise BrokerRateLimitError(
+                    BrokerDiagnostic(
+                        status=BrokerDiagnosticStatus.RATE_LIMIT,
+                        code=code,
+                        sanitized_message="FYERS rate limit hit.",
+                        sanitized_structured_fields=fields,
+                    )
+                )
+            raise BrokerDataError(
+                BrokerDiagnostic(
+                    status=BrokerDiagnosticStatus.DATA_ERROR,
+                    code=code,
+                    sanitized_message="FYERS /history returned an error.",
+                    sanitized_structured_fields=fields,
+                )
+            )
 
         if ep.CANDLES_KEY not in payload:
             raise BrokerDataError(
-                f"/history response has status 'ok' but no {ep.CANDLES_KEY!r} key. "
-                f"Keys present: {sorted(payload)}. The response format may have "
-                "changed; verify against current FYERS documentation."
+                BrokerDiagnostic(
+                    status=BrokerDiagnosticStatus.DATA_ERROR,
+                    code=None,
+                    sanitized_message=(
+                        f"/history response has status 'ok' but no "
+                        f"{ep.CANDLES_KEY!r} key. The response format may have "
+                        "changed; verify against current FYERS documentation."
+                    ),
+                )
             )
         return from_fyers_candles(payload[ep.CANDLES_KEY] or [])
 

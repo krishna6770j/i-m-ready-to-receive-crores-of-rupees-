@@ -163,7 +163,10 @@ def test_failed_chunk_is_reported_not_hidden():
         "X", "1", date(2026, 1, 1), date(2026, 12, 31)
     )
     assert len(report.failed_chunks) == 1
-    assert "server error" in report.failed_chunks[0].error
+    # Regression: the raw broker message must never leak into our own error
+    # text, since it could carry a secret (a token, part of a header, etc).
+    assert "server error" not in report.failed_chunks[0].error
+    assert "FYERS /history returned an error" in report.failed_chunks[0].error
     assert len(frame) == 6, "the three successful chunks must all survive"
     assert report.duplicate_rows_removed == 0
 

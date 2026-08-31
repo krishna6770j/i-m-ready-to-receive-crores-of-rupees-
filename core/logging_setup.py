@@ -14,6 +14,8 @@ import re
 import uuid
 from pathlib import Path
 
+from core.secrets import REDACTED, scrub as _scrub_registered
+
 _SECRET_ENV_VARS = (
     "FYERS_ACCESS_TOKEN",
     "FYERS_SECRET_KEY",
@@ -29,11 +31,15 @@ _PATTERNS = (
     re.compile(r"(appIdHash\"?\s*[:=]\s*\"?)[0-9a-f]{64}", re.IGNORECASE),
 )
 
-REDACTED = "***REDACTED***"
-
 
 def _current_secret_literals() -> list[str]:
     """Read secret values from the environment AT CALL TIME.
+
+    SECONDARY mechanism only, kept as defence in depth. The PRIMARY mechanism
+    is ``core.secrets.registry``: values registered there (via settings load
+    and the FYERS auth flow) redact regardless of whether they still match a
+    current environment variable, which matters for auth codes (never in the
+    environment at all) and rotated-out tokens (no longer the env value).
 
     Deliberately not cached. Credentials are commonly loaded after logging is
     configured -- ``load_settings()`` calls ``load_dotenv()`` on first use --
@@ -44,7 +50,14 @@ def _current_secret_literals() -> list[str]:
 
 
 def scrub(text: str) -> str:
-    """Remove known secret values and secret-shaped patterns from a string."""
+    """Remove known secret values and secret-shaped patterns from a string.
+
+    Order: registered literals (primary, any length, never forgotten) first,
+    then the environment fallback, then shape-based patterns for secrets that
+    were never registered at all (e.g. a value pasted into a log line by
+    mistake).
+    """
+    text = _scrub_registered(text)
     for literal in _current_secret_literals():
         text = text.replace(literal, REDACTED)
     for pattern in _PATTERNS:

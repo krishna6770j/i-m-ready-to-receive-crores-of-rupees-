@@ -19,6 +19,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from core.secrets import register as _register_secret
 from core.types import TradingMode
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -119,13 +120,25 @@ def load_settings(env_file: str | Path | None = None, *, override: bool = False)
     if not log_dir.is_absolute():
         log_dir = PROJECT_ROOT / log_dir
 
+    client_id = os.getenv("FYERS_CLIENT_ID") or None
+    secret_key = os.getenv("FYERS_SECRET_KEY") or None
+    access_token = os.getenv("FYERS_ACCESS_TOKEN") or None
+
+    # Register credential material the moment it is loaded, so log redaction
+    # (core.logging_setup.scrub) can find it even if the value is later
+    # unset from the environment or rotated. Ordinary config values (paths,
+    # trading mode, redirect_uri) are not secrets and are not registered.
+    for value in (client_id, secret_key, access_token):
+        if value:
+            _register_secret(value)
+
     return Settings(
         trading_mode=_resolve_mode(os.getenv("TRADING_MODE")),
         fyers=FyersCredentials(
-            client_id=os.getenv("FYERS_CLIENT_ID") or None,
-            secret_key=os.getenv("FYERS_SECRET_KEY") or None,
+            client_id=client_id,
+            secret_key=secret_key,
             redirect_uri=os.getenv("FYERS_REDIRECT_URI") or None,
-            access_token=os.getenv("FYERS_ACCESS_TOKEN") or None,
+            access_token=access_token,
         ),
         data_store_dir=data_dir,
         log_dir=log_dir,

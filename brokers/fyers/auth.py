@@ -29,6 +29,8 @@ from __future__ import annotations
 import logging
 from urllib.parse import parse_qs, urlparse
 
+from core.secrets import register as _register_secret
+
 logger = logging.getLogger(__name__)
 
 RESPONSE_TYPE = "code"
@@ -38,6 +40,11 @@ GRANT_TYPE = "authorization_code"
 # (see endpoints.py), so extraction falls back across plausible keys and raises
 # a clear error rather than returning None.
 _TOKEN_KEYS = ("access_token", "accessToken")
+
+# Not observed in any response yet -- FYERS' 2FA-per-day flow described in the
+# module docstring has no documented refresh token, but if one is ever added
+# it must be registered the moment it is seen, same as the access token.
+_REFRESH_TOKEN_KEYS = ("refresh_token", "refreshToken")
 
 
 class FyersAuthError(RuntimeError):
@@ -72,7 +79,9 @@ def extract_auth_code(redirect_url: str) -> str:
     params = parse_qs(parsed.query)
     for key in ("auth_code", "authcode", "code"):
         if key in params and params[key]:
-            return params[key][0]
+            code = params[key][0]
+            _register_secret(code)
+            return code
     raise FyersAuthError(
         "No 'auth_code' parameter found in the redirect URL. Paste the FULL URL "
         "from the browser address bar after logging in, including everything "
@@ -85,6 +94,7 @@ def exchange_auth_code(session, auth_code: str) -> str:
 
     Returns the token. Never logs it.
     """
+    _register_secret(auth_code)
     session.set_token(auth_code)
     response = session.generate_token()
 
@@ -92,11 +102,18 @@ def exchange_auth_code(session, auth_code: str) -> str:
         raise FyersAuthError(
             f"Unexpected token response type {type(response).__name__}."
         )
+    for key in _REFRESH_TOKEN_KEYS:
+        refresh_token = response.get(key)
+        if refresh_token:
+            _register_secret(str(refresh_token))
+
     for key in _TOKEN_KEYS:
         token = response.get(key)
         if token:
+            token = str(token)
+            _register_secret(token)
             logger.info("Access token obtained (value not logged).")
-            return str(token)
+            return token
 
     # Surface diagnostic keys but never the payload values, which may contain
     # partial credentials.

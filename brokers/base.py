@@ -18,9 +18,24 @@ from datetime import date
 
 import pandas as pd
 
+from brokers.diagnostics import BrokerDiagnostic
+
 
 class BrokerError(RuntimeError):
-    """Base class for broker adapter failures."""
+    """Base class for broker adapter failures.
+
+    Carries a :class:`~brokers.diagnostics.BrokerDiagnostic` ONLY -- never a
+    raw broker payload or unsanitized message. ``str()``/``repr()`` both
+    route through the diagnostic's already-sanitized text, so nothing extra
+    needs to be scrubbed at the call site that raises.
+    """
+
+    def __init__(self, diagnostic: BrokerDiagnostic) -> None:
+        super().__init__(diagnostic.sanitized_message)
+        self.diagnostic = diagnostic
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.diagnostic!r})"
 
 
 class BrokerAuthError(BrokerError):
