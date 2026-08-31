@@ -221,6 +221,19 @@ def _require_ist_timestamp(ts: object, label: str) -> pd.Timestamp:
     return ts
 
 
+def _require_bool(value: object, label: str) -> bool:
+    """Exact ``bool`` only -- ``"yes"``, ``1``, or any other truthy-but-not-
+    ``bool`` value is rejected outright rather than coerced with
+    ``bool(...)``. A calendar returning the wrong type is a protocol
+    violation, not something to silently paper over.
+    """
+    if type(value) is not bool:
+        raise TypeError(
+            f"{label} must return an actual bool, got {value!r} ({type(value).__name__})"
+        )
+    return value
+
+
 def _require_resolution(resolution: str) -> Resolution:
     try:
         return Resolution(resolution)
@@ -256,6 +269,13 @@ def certify_continuity(
     unexplained transition -> ``FAILED``. There is no elapsed-time
     threshold: an overnight/weekend-sized gap is fully ``CERTIFIED`` if the
     calendar says the observed candle is exactly the expected next bar.
+
+    With FEWER THAN 2 observations there is no transition to evaluate at
+    all -- continuity answers whether transitions between observations are
+    complete, and with 0 or 1 candles that question has no evidence to
+    answer it either way. This is ``NOT_CERTIFIED`` (insufficient evidence),
+    never ``CERTIFIED`` (vacuously) and never ``FAILED`` (there is nothing
+    contradictory), for BOTH ``NullCalendar`` and a configured calendar.
     """
     assert_canonical(frame)
     resolution_enum = _require_resolution(resolution)
@@ -288,6 +308,14 @@ def certify_continuity(
 
     _require_calendar_shape(calendar)
     _require_calendar_identity(calendar)
+
+    if len(timestamps) < 2:
+        return ContinuityCertification(
+            status=CertificationStatus.NOT_CERTIFIED,
+            calendar_id=calendar.calendar_id,
+            calendar_version=calendar.calendar_version,
+            gap_explanations=(),
+        )
 
     all_explained = True
     for i in range(1, len(timestamps)):
@@ -358,7 +386,18 @@ def certify_sessions(
 
     invalid: list[str] = []
     for ts in timestamps:
-        valid = calendar.is_session_day(ts.date()) and calendar.is_valid_bar(ts, resolution)
+        # Both facts are evaluated and type-checked EXPLICITLY, never via
+        # `a() and b()` short-circuiting -- if is_session_day() returns
+        # False first, short-circuiting would skip calling is_valid_bar()
+        # entirely, letting a broken is_valid_bar() implementation go
+        # completely undetected on that candle.
+        session_day_result = _require_bool(
+            calendar.is_session_day(ts.date()), "is_session_day(...) return value"
+        )
+        valid_bar_result = _require_bool(
+            calendar.is_valid_bar(ts, resolution), "is_valid_bar(...) return value"
+        )
+        valid = session_day_result and valid_bar_result
         if not valid:
             invalid.append(ts.isoformat())
 

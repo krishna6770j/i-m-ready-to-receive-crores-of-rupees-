@@ -243,16 +243,16 @@ def test_continuity_unexplained_multiday_gap_fails():
 
 def test_no_arbitrary_30_day_rule_exists():
     """A gap far larger than any historical 30-day threshold must still be
-    CERTIFIED if the calendar says it is exactly the expected next bar."""
+    CERTIFIED if the calendar says it is exactly the expected next bar --
+    using a genuine two-observation transition, not a vacuous single row."""
     friday = _find_friday()
-    # Simulate a very long weekend-like explained gap using the daily resolution.
+    next_session_day = friday + pd.Timedelta(days=3)  # Friday -> Monday
     frame_daily = _frame_from_timestamps(
         [
             pd.Timestamp(friday.isoformat(), tz=IST_NAME),
+            pd.Timestamp(next_session_day.isoformat(), tz=IST_NAME),
         ]
     )
-    # Single-row frame: vacuously certified (nothing to fail on), proving no
-    # a-priori day-count gate exists at the entry point either.
     result = certify_continuity(frame_daily, "1D", FakeCalendar())
     assert result.status is CertificationStatus.CERTIFIED
 
@@ -365,3 +365,110 @@ def test_noncanonical_frame_rejected_never_repaired():
         certify_continuity(frame, "1", FakeCalendar())
     with pytest.raises(SchemaError):
         certify_sessions(frame, "1", FakeCalendar())
+
+
+# ---------------------------------------------------------------------------
+# Unit 13A final hardening: <2-observation continuity rule, and strict
+# non-short-circuiting bool checks on is_session_day/is_valid_bar.
+# ---------------------------------------------------------------------------
+
+
+def test_continuity_empty_canonical_frame_not_certified():
+    frame = _frame_from_timestamps([])
+    result_null = certify_continuity(frame, "1", NullCalendar())
+    assert result_null.status is CertificationStatus.NOT_CERTIFIED
+    result_calendar = certify_continuity(frame, "1", FakeCalendar())
+    assert result_calendar.status is CertificationStatus.NOT_CERTIFIED
+
+
+def test_continuity_one_row_with_null_calendar_not_certified():
+    frame = _frame_from_timestamps([_ts("2026-01-01 09:15")])
+    result = certify_continuity(frame, "1", NullCalendar())
+    assert result.status is CertificationStatus.NOT_CERTIFIED
+
+
+def test_continuity_one_row_with_configured_calendar_not_certified():
+    """The overcertification regression: a single-row frame has no
+    transition to evaluate at all, so it must be NOT_CERTIFIED
+    (insufficient evidence) -- never vacuously CERTIFIED, never FAILED."""
+    frame = _frame_from_timestamps([_ts("2026-01-01 09:15")])
+    result = certify_continuity(frame, "1", FakeCalendar())
+    assert result.status is CertificationStatus.NOT_CERTIFIED
+    assert result.gap_explanations == ()
+
+
+def test_continuity_two_expected_consecutive_bars_certified():
+    frame = _frame_from_timestamps([_ts("2026-01-01 09:15"), _ts("2026-01-01 09:16")])
+    result = certify_continuity(frame, "1", FakeCalendar())
+    assert result.status is CertificationStatus.CERTIFIED
+
+
+# --- strict, non-short-circuiting bool checks -------------------------------
+
+
+class SessionDayReturnsStringCalendar(FakeCalendar):
+    def is_session_day(self, day):
+        return "yes"
+
+
+class SessionDayReturnsIntCalendar(FakeCalendar):
+    def is_session_day(self, day):
+        return 1
+
+
+class ValidBarReturnsStringCalendar(FakeCalendar):
+    def is_valid_bar(self, ts, resolution):
+        return "yes"
+
+
+class ValidBarReturnsIntCalendar(FakeCalendar):
+    def is_valid_bar(self, ts, resolution):
+        return 1
+
+
+class SessionDayFalseButValidBarBrokenCalendar(FakeCalendar):
+    """is_session_day() correctly returns False (a real bool) for every
+    day, but is_valid_bar() is broken (wrong type). If session certification
+    ever short-circuited on ``is_session_day(...) and is_valid_bar(...)``,
+    this broken is_valid_bar() would never even be called, and its protocol
+    violation would go completely undetected.
+    """
+
+    def is_session_day(self, day):
+        return False
+
+    def is_valid_bar(self, ts, resolution):
+        return "not-a-bool"
+
+
+def test_session_day_returns_string_rejected():
+    frame = _frame_from_timestamps([_ts("2026-01-01 09:15")])
+    with pytest.raises(TypeError, match="is_session_day"):
+        certify_sessions(frame, "1", SessionDayReturnsStringCalendar())
+
+
+def test_session_day_returns_int_rejected():
+    frame = _frame_from_timestamps([_ts("2026-01-01 09:15")])
+    with pytest.raises(TypeError, match="is_session_day"):
+        certify_sessions(frame, "1", SessionDayReturnsIntCalendar())
+
+
+def test_valid_bar_returns_string_rejected():
+    frame = _frame_from_timestamps([_ts("2026-01-01 09:15")])
+    with pytest.raises(TypeError, match="is_valid_bar"):
+        certify_sessions(frame, "1", ValidBarReturnsStringCalendar())
+
+
+def test_valid_bar_returns_int_rejected():
+    frame = _frame_from_timestamps([_ts("2026-01-01 09:15")])
+    with pytest.raises(TypeError, match="is_valid_bar"):
+        certify_sessions(frame, "1", ValidBarReturnsIntCalendar())
+
+
+def test_valid_bar_protocol_violation_detected_even_when_session_day_false():
+    """Proves session certification never short-circuits: is_session_day()
+    returning a genuine False must NOT skip calling/type-checking
+    is_valid_bar() -- a broken is_valid_bar() must still be caught."""
+    frame = _frame_from_timestamps([_ts("2026-01-01 09:15")])
+    with pytest.raises(TypeError, match="is_valid_bar"):
+        certify_sessions(frame, "1", SessionDayFalseButValidBarBrokenCalendar())
