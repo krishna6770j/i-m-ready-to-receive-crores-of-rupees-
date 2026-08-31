@@ -840,6 +840,25 @@ solve the knowledge problem, it only relocated the arbitrariness. No
 enter provenance when a real calendar arrives. **No NSE data is invented.** Only
 `NullCalendar` ships.
 
+**Correction (Unit 13A): `is_session_day` + `expected_next_bar` alone cannot
+certify sessions independently.** Both are RELATIONAL — they reason about the
+transition between two consecutive observations (or a calendar day as a whole).
+Neither can answer, for a single arbitrary timestamp in isolation (most
+importantly the *first* candle of a dataset, which has no predecessor to relate
+it to), whether that exact instant is a valid session bar: `is_session_day`
+only confirms the calendar DAY trades at all, not that a given intraday
+timestamp falls inside session hours or lands on a valid bar boundary for the
+resolution. Session certification (this section) needs that per-timestamp
+answer for every candle, not just the ones with a predecessor. `TradingCalendar`
+therefore gains one more method:
+
+    is_valid_bar(ts, resolution) -> bool
+
+A protocol capability only — no NSE session hours are implied or invented by
+adding this method signature. `NullCalendar` answers `False` unconditionally
+(no calendar knowledge), which is why `SessionCertification` under
+`NullCalendar` is `NOT_CERTIFIED`, never `CERTIFIED`.
+
 | Situation | `ContinuityCertification` |
 |---|---|
 | No calendar configured | `NOT_CERTIFIED` — uniformly, every gap size |
