@@ -817,9 +817,15 @@ def test_valid_trusted_dataset_still_writes_normally(tmp_path):
     assert result.current_updated is True
 
 
-def test_validation_policy_causing_invalid_also_triggers_the_gate(tmp_path):
-    # A frame that is OHLC-valid under default validation but INVALID under
-    # a stricter policy (a large gap flagged as EXCESSIVE_DATA_GAP).
+def test_max_session_gap_days_no_longer_flips_the_trust_gate(tmp_path):
+    # Per Unit 13B: max_session_gap_days is a legacy, schema-v1-compatible
+    # field only -- elapsed gap size, by itself, can no longer make
+    # MarketDataValidity INVALID. A frame that used to become INVALID (and
+    # therefore rejected by the trusted-write gate) purely from a strict
+    # max_session_gap_days now stays VALID and writes normally under EITHER
+    # policy. (Any actually-invalid dataset still triggers the gate --
+    # see test_invalid_dataset_with_trusted_envelope_rejected and friends,
+    # which construct invalidity from a genuine OHLC violation instead.)
     ts0 = pd.Timestamp("2026-01-01 09:15", tz=IST_NAME)
     raw = pd.DataFrame(
         {
@@ -837,12 +843,12 @@ def test_validation_policy_causing_invalid_also_triggers_the_gate(tmp_path):
     ds_lenient = ValidatedDataset.build(raw, identity=_identity(), validation_policy=lenient_policy)
     ds_strict = ValidatedDataset.build(raw, identity=_identity(), validation_policy=strict_policy)
     assert ds_lenient.market_data_validity is MarketDataValidity.VALID
-    assert ds_strict.market_data_validity is MarketDataValidity.INVALID
+    assert ds_strict.market_data_validity is MarketDataValidity.VALID
 
     # This dataset spans two calendar dates (Jan 1 and Jan 11), so the
     # generic single-day _fetch_for() helper does not apply -- build a
     # matching two-chunk fetch covering the full requested span.
-    fetch_lenient = FetchReportSnapshot(
+    fetch = FetchReportSnapshot(
         symbol="NIFTY", resolution="1",
         requested_from="2026-01-01", requested_to="2026-01-11",
         chunks=(
@@ -855,14 +861,14 @@ def test_validation_policy_causing_invalid_also_triggers_the_gate(tmp_path):
         duplicate_rows_removed=0, conflicting_timestamps=0,
     )
     env_lenient = ProvenanceEnvelope.build(
-        ds_lenient, fetch=fetch_lenient, generation_id=uuid.uuid4()
+        ds_lenient, fetch=fetch, generation_id=uuid.uuid4()
     )
-    # lenient writes fine
-    write_generation(ds_lenient, env_lenient, tmp_path)
+    result_lenient = write_generation(ds_lenient, env_lenient, tmp_path)
+    assert result_lenient.namespace is Namespace.TRUSTED
 
-    env_strict = ProvenanceEnvelope.build(ds_strict, forced=False, generation_id=uuid.uuid4())
-    with pytest.raises(GenerationConsistencyError):
-        write_generation(ds_strict, env_strict, tmp_path)
+    env_strict = ProvenanceEnvelope.build(ds_strict, fetch=fetch, generation_id=uuid.uuid4())
+    result_strict = write_generation(ds_strict, env_strict, tmp_path)
+    assert result_strict.namespace is Namespace.TRUSTED
 
 
 def test_adversarial_valid_then_invalid_trusted_attempt_leaves_current_and_disk_untouched(tmp_path):

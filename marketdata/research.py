@@ -19,15 +19,29 @@ trust semantics.** It only reads already-certified facts already exposed by
 ``.requested_window_comparison``, ``.source_evidence``) and evaluates them
 against caller-declared thresholds.
 
-**Future certifications explicitly not implemented here**: continuity
-certification, session certification, and reproducibility certification are
-all facts the frozen architecture anticipates a LATER unit will supply
-(Unit 13+). No such certification exists anywhere in this codebase yet.
-Rather than inventing a placeholder verdict, this module exposes the three
-corresponding policy flags but makes ``require_*_certified=True`` ALWAYS
-evaluate as an unmet requirement -- "not yet available" is reported
-honestly, never silently treated as satisfied and never defaulted to
-"certified".
+**Continuity/session certification (Unit 13B)**: ``require_continuity_certified``/
+``require_session_certified`` now check the actual
+``trusted.continuity_certification``/``trusted.session_certification``
+facts ``read_trusted()`` attaches (``marketdata.continuity``). Both
+``NOT_CERTIFIED`` and ``FAILED`` are policy failures -- only an actual
+``CERTIFIED`` status passes. This module still does not compute those
+certifications itself, and still does not weaken or reinterpret
+``TrustedDataset`` trust semantics: a ``TrustedDataset`` whose continuity/
+session certification is ``FAILED`` is still a perfectly sound artifact:
+whether that soundness is enough for a given experiment is exactly what
+this policy decides.
+
+**Reproducibility certification remains NOT AVAILABLE.** No such
+certification exists anywhere in this codebase yet (a later, separately
+authorised unit). Rather than inventing a placeholder verdict,
+``require_reproducibility_certified=True`` ALWAYS evaluates as an unmet
+requirement -- "not yet available" is reported honestly, never silently
+treated as satisfied and never defaulted to "certified".
+
+**Continuity/session certification does NOT imply**: requested-range
+completeness, bar-density completeness, earliest available history, a
+retention boundary, or data freshness. None of those claims are made here
+or anywhere in ``marketdata.continuity``.
 """
 
 from __future__ import annotations
@@ -37,6 +51,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from marketdata.continuity import CertificationStatus
 from marketdata.trusted_reader import TrustedDataset
 
 
@@ -194,18 +209,28 @@ def _evaluate(trusted: TrustedDataset, policy: ResearchDataPolicy) -> tuple[str,
             "source_evidence.timestamps_sorted is False"
         )
 
-    # Not yet implemented anywhere in this codebase (Unit 13+): True always
-    # reports unmet/not-available, never silently satisfied.
     if policy.require_continuity_certified:
-        unmet.append(
-            "require_continuity_certified=True but continuity "
-            "certification is not yet implemented -- NOT AVAILABLE"
-        )
+        continuity_status = trusted.continuity_certification.status
+        if continuity_status is not CertificationStatus.CERTIFIED:
+            unmet.append(
+                "require_continuity_certified=True but "
+                f"continuity_certification.status={continuity_status.value} "
+                "(NOT_CERTIFIED and FAILED are both policy failures; only "
+                "CERTIFIED passes)"
+            )
     if policy.require_session_certified:
-        unmet.append(
-            "require_session_certified=True but session certification is "
-            "not yet implemented -- NOT AVAILABLE"
-        )
+        session_status = trusted.session_certification.status
+        if session_status is not CertificationStatus.CERTIFIED:
+            unmet.append(
+                "require_session_certified=True but "
+                f"session_certification.status={session_status.value} "
+                "(NOT_CERTIFIED and FAILED are both policy failures; only "
+                "CERTIFIED passes)"
+            )
+
+    # Not yet implemented anywhere in this codebase (a later, separately
+    # authorised unit): True always reports unmet/not-available, never
+    # silently satisfied.
     if policy.require_reproducibility_certified:
         unmet.append(
             "require_reproducibility_certified=True but reproducibility "

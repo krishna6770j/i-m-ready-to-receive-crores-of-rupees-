@@ -869,6 +869,24 @@ adding this method signature. `NullCalendar` answers `False` unconditionally
 cannot be answered. A `TrustedDataset` may carry it. Whether that is acceptable
 is decided by `ResearchDataPolicy`, not by a calendar-day threshold.
 
+**Integration (Unit 13B).** The validator's `ABSURD_GAP_DAYS` absurdity
+ceiling and `max_session_gap_days`-gated `EXCESSIVE_DATA_GAP` ERROR are
+removed: elapsed calendar-day gap size, by itself, never makes
+`MarketDataValidity` `INVALID`. `max_session_gap_days` remains on
+`ValidationPolicy` for schema-v1 compatibility only (already serialised in
+provenance) and, when supplied, now produces a non-gating
+`LEGACY_MAX_SESSION_GAP_POLICY_NON_GATING` `WARNING` instead. `read_trusted()`
+takes an optional `calendar` (`NullCalendar` if omitted) and attaches
+`continuity_certification`/`session_certification` to the returned
+`TrustedDataset` as facts — never as an acceptance gate: a `FAILED` or
+`NOT_CERTIFIED` result never makes `read_trusted()` reject a generation.
+`ResearchDataPolicy.require_continuity_certified`/`require_session_certified`
+now check those attached facts directly (`NOT_CERTIFIED` and `FAILED` are both
+policy failures; only `CERTIFIED` passes) — replacing the Unit 11 placeholder
+that unconditionally reported them as not yet available.
+`require_reproducibility_certified` remains a placeholder; no reproducibility
+certification exists yet.
+
 ---
 
 ## 20. Secret lifecycle

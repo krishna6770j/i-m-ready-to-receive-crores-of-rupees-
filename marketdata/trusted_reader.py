@@ -84,6 +84,14 @@ from marketdata.acquisition import (
     cross_check_fetch_against_dataset,
     validate_fetch_evidence,
 )
+from marketdata.continuity import (
+    ContinuityCertification,
+    NullCalendar,
+    SessionCertification,
+    TradingCalendar,
+    certify_continuity,
+    certify_sessions,
+)
 from marketdata.dataset import MarketDataValidity, ValidationPolicy
 from marketdata.evidence import (
     FetchReportSnapshot,
@@ -197,11 +205,21 @@ class TrustedDataset:
 
     Deliberately does NOT expose ``is_authoritative`` or any other stored
     trust boolean -- this TYPE is the certification. Deliberately does NOT
-    claim continuity certification, session-completeness certification,
-    density completeness, reproducibility certification, or "freshest
+    claim density completeness, reproducibility certification, or "freshest
     generation": none of those are checked by this pipeline, and claiming
     them here would be exactly the kind of invented guarantee the frozen
     architecture's problem statement warns against.
+
+    ``continuity_certification``/``session_certification`` (Unit 13B) are
+    ATTACHED FACTS, derived from the same certified canonical frame using
+    ``marketdata.continuity``, with whatever ``TradingCalendar`` the caller
+    supplied to :func:`read_trusted` (``NullCalendar`` if none). They do NOT
+    decide whether this artifact is trusted: a ``FAILED`` or
+    ``NOT_CERTIFIED`` continuity/session result never makes ``read_trusted``
+    reject a generation -- the artifact may still be a perfectly sound
+    stored artifact. Whether that is acceptable for a given experiment is
+    ``ResearchDataPolicy``'s decision (``marketdata.research``), not this
+    type's.
     """
 
     __slots__ = (
@@ -218,6 +236,8 @@ class TrustedDataset:
         "_acquisition_status",
         "_observed_data_coverage",
         "_requested_window_comparison",
+        "_continuity_certification",
+        "_session_certification",
         "_frame",
     )
 
@@ -262,6 +282,8 @@ class TrustedDataset:
         acquisition_status: AcquisitionRequestStatus,
         observed_data_coverage: ObservedDataCoverage,
         requested_window_comparison: RequestedWindowComparison,
+        continuity_certification: ContinuityCertification,
+        session_certification: SessionCertification,
         frame: pd.DataFrame,
     ) -> "TrustedDataset":
         self = object.__new__(cls)
@@ -280,6 +302,8 @@ class TrustedDataset:
         object.__setattr__(
             self, "_requested_window_comparison", requested_window_comparison
         )
+        object.__setattr__(self, "_continuity_certification", continuity_certification)
+        object.__setattr__(self, "_session_certification", session_certification)
         object.__setattr__(self, "_frame", frame)
         return self
 
@@ -352,6 +376,20 @@ class TrustedDataset:
     @property
     def requested_window_comparison(self) -> RequestedWindowComparison:
         return self._requested_window_comparison
+
+    @property
+    def continuity_certification(self) -> ContinuityCertification:
+        """An ATTACHED FACT, not a trust decision -- see the class
+        docstring. ``NOT_CERTIFIED``/``FAILED`` here never means this
+        ``TrustedDataset`` is unsound."""
+        return self._continuity_certification
+
+    @property
+    def session_certification(self) -> SessionCertification:
+        """An ATTACHED FACT, not a trust decision -- see the class
+        docstring. ``NOT_CERTIFIED``/``FAILED`` here never means this
+        ``TrustedDataset`` is unsound."""
+        return self._session_certification
 
     @property
     def frame(self) -> pd.DataFrame:
@@ -528,12 +566,32 @@ class UnverifiedDataset:
 # ---------------------------------------------------------------------------
 
 
-def read_trusted(root: Path, *, source: str, symbol: str, resolution: str) -> TrustedDataset:
+def read_trusted(
+    root: Path,
+    *,
+    source: str,
+    symbol: str,
+    resolution: str,
+    calendar: TradingCalendar | None = None,
+) -> TrustedDataset:
     """Read and fully re-verify the generation ``CURRENT`` names for
     ``(source, symbol, resolution)``. See the module docstring for the
     exact pipeline; any failed step raises ``TrustedReadError`` and nothing
     later in the pipeline ever runs.
+
+    ``calendar``: an optional ``TradingCalendar`` (``marketdata.continuity``)
+    used ONLY to derive the ``continuity_certification``/
+    ``session_certification`` facts attached to the returned
+    ``TrustedDataset`` -- ``None`` uses ``NullCalendar`` (no calendar
+    knowledge). This is a RUNTIME certification input only; it is never
+    persisted into provenance, and it never affects whether this function
+    accepts or rejects the generation. A ``FAILED``/``NOT_CERTIFIED``
+    certification is still attached to a ``TrustedDataset`` this function
+    happily returns -- artifact trust and continuity/session suitability
+    are deliberately separate questions (frozen architecture section 19;
+    ``ResearchDataPolicy`` decides suitability, not this function).
     """
+    resolved_calendar: TradingCalendar = calendar if calendar is not None else NullCalendar()
     identity = DatasetIdentity(source=source, symbol=symbol, resolution=resolution)
     dataset_dir = _dataset_dir(root, identity)
 
@@ -721,6 +779,11 @@ def read_trusted(root: Path, *, source: str, symbol: str, resolution: str) -> Tr
     observed_data_coverage = compute_observed_data_coverage(frame_view)
     requested_window_comparison = compute_requested_window_comparison(frame_view, manifest.fetch)
 
+    # Attached facts only -- derived AFTER every trust check has already
+    # passed, and never fed back into whether this generation is accepted.
+    continuity_certification = certify_continuity(frame, resolution, resolved_calendar)
+    session_certification = certify_sessions(frame, resolution, resolved_calendar)
+
     return TrustedDataset._construct(
         identity=identity,
         data_digest=recomputed_data_digest,
@@ -735,6 +798,8 @@ def read_trusted(root: Path, *, source: str, symbol: str, resolution: str) -> Tr
         acquisition_status=acquisition_status,
         observed_data_coverage=observed_data_coverage,
         requested_window_comparison=requested_window_comparison,
+        continuity_certification=continuity_certification,
+        session_certification=session_certification,
         frame=frame,
     )
 

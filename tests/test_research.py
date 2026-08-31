@@ -71,14 +71,20 @@ def _fetch_covering(ds: ValidatedDataset, requested_from: str, requested_to: str
     )
 
 
-def _write_and_read_trusted(root, ds: ValidatedDataset, fetch: FetchReportSnapshot) -> TrustedDataset:
+def _write_and_read_trusted(
+    root, ds: ValidatedDataset, fetch: FetchReportSnapshot, *, calendar=None
+) -> TrustedDataset:
     env = ProvenanceEnvelope.build(ds, fetch=fetch)
     write_generation(ds, env, root)
+    kwargs = {}
+    if calendar is not None:
+        kwargs["calendar"] = calendar
     return read_trusted(
         root,
         source=ds.identity.source,
         symbol=ds.identity.symbol,
         resolution=ds.identity.resolution,
+        **kwargs,
     )
 
 
@@ -356,22 +362,33 @@ def test_research_ready_dataset_attribute_assignment_blocked(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Future certification flags: never silently pass
+# Continuity/session certification requirements (Unit 13B): both
+# NOT_CERTIFIED and FAILED are policy failures; only CERTIFIED passes.
+# Reproducibility remains a future flag that never silently passes.
 # ---------------------------------------------------------------------------
 
 
-def test_require_continuity_certified_always_fails_today(tmp_path):
+def test_require_continuity_certified_fails_with_null_calendar_not_certified(tmp_path):
+    """A TrustedDataset read with the default NullCalendar always has
+    continuity_certification.status == NOT_CERTIFIED -- requiring
+    certification against it must fail, showing the actual status."""
     trusted = _one_day_trusted(tmp_path)
     with pytest.raises(ResearchPolicyError) as excinfo:
         ResearchReadyDataset.build(trusted, ResearchDataPolicy(require_continuity_certified=True))
-    assert any("continuity" in reason and "NOT AVAILABLE" in reason for reason in excinfo.value.unmet_requirements)
+    assert any(
+        "continuity_certification.status=NOT_CERTIFIED" in reason
+        for reason in excinfo.value.unmet_requirements
+    )
 
 
-def test_require_session_certified_always_fails_today(tmp_path):
+def test_require_session_certified_fails_with_null_calendar_not_certified(tmp_path):
     trusted = _one_day_trusted(tmp_path)
     with pytest.raises(ResearchPolicyError) as excinfo:
         ResearchReadyDataset.build(trusted, ResearchDataPolicy(require_session_certified=True))
-    assert any("session" in reason and "NOT AVAILABLE" in reason for reason in excinfo.value.unmet_requirements)
+    assert any(
+        "session_certification.status=NOT_CERTIFIED" in reason
+        for reason in excinfo.value.unmet_requirements
+    )
 
 
 def test_require_reproducibility_certified_always_fails_today(tmp_path):
@@ -446,3 +463,189 @@ def test_require_pristine_source_order_must_be_bool():
 def test_boundary_fraction_values_accepted():
     ResearchDataPolicy(min_requested_window_fraction=0.0)
     ResearchDataPolicy(min_requested_window_fraction=1.0)
+
+
+# ---------------------------------------------------------------------------
+# Unit 13B: continuity/session certification requirements
+# ---------------------------------------------------------------------------
+
+from marketdata.continuity import CertificationStatus
+
+
+class _AlwaysExplainedFakeCalendar:
+    """Obviously-fake test-only calendar: every transition is EXPLAINED and
+    every candle is a valid session bar, regardless of elapsed size. NOT
+    NSE -- never imported by production code.
+    """
+
+    calendar_id = "fake-always-explained"
+    calendar_version = "1"
+
+    def is_session_day(self, day) -> bool:
+        return True
+
+    def is_valid_bar(self, ts, resolution) -> bool:
+        return True
+
+    def expected_next_bar(self, ts, resolution):
+        if resolution == "1D":
+            return ts + pd.Timedelta(days=1)
+        return ts + pd.Timedelta(minutes=int(resolution))
+
+
+class _NeverExplainedFakeCalendar(_AlwaysExplainedFakeCalendar):
+    """Obviously-fake test-only calendar: claims every transition is wrong
+    (always UNEXPLAINED). NOT NSE.
+    """
+
+    calendar_id = "fake-never-explained"
+
+    def expected_next_bar(self, ts, resolution):
+        return ts + pd.Timedelta(days=999)
+
+
+class _NoValidBarFakeCalendar(_AlwaysExplainedFakeCalendar):
+    """Obviously-fake test-only calendar: every candle fails is_valid_bar.
+    NOT NSE.
+    """
+
+    calendar_id = "fake-no-valid-bar"
+
+    def is_valid_bar(self, ts, resolution) -> bool:
+        return False
+
+
+class _NinetyDayExplainedFakeCalendar(_AlwaysExplainedFakeCalendar):
+    """Obviously-fake test-only calendar built specifically to explain the
+    90-day gap used in the critical separation tests: it claims the next
+    bar after ANY timestamp is exactly 90 days later. This is not a real
+    calendar rule -- it exists only to prove that calendar knowledge (not
+    elapsed-time magnitude) is what makes a gap CERTIFIED. NOT NSE.
+    """
+
+    calendar_id = "fake-ninety-day-explained"
+
+    def expected_next_bar(self, ts, resolution):
+        return ts + pd.Timedelta(days=90)
+
+
+def _two_minute_dataset(tmp_path):
+    ds = _dataset(["2026-01-01"], n_per_day=2)
+    fetch = _fetch_covering(ds, "2026-01-01", "2026-01-01")
+    return ds, fetch
+
+
+def test_continuity_certified_passes_when_required(tmp_path):
+    ds, fetch = _two_minute_dataset(tmp_path)
+    trusted = _write_and_read_trusted(tmp_path, ds, fetch, calendar=_AlwaysExplainedFakeCalendar())
+    assert trusted.continuity_certification.status is CertificationStatus.CERTIFIED
+    ResearchReadyDataset.build(trusted, ResearchDataPolicy(require_continuity_certified=True))
+
+
+def test_continuity_not_certified_fails_when_required(tmp_path):
+    trusted = _one_day_trusted(tmp_path)  # default NullCalendar
+    assert trusted.continuity_certification.status is CertificationStatus.NOT_CERTIFIED
+    with pytest.raises(ResearchPolicyError):
+        ResearchReadyDataset.build(trusted, ResearchDataPolicy(require_continuity_certified=True))
+
+
+def test_continuity_failed_fails_when_required(tmp_path):
+    ds, fetch = _two_minute_dataset(tmp_path)
+    trusted = _write_and_read_trusted(tmp_path, ds, fetch, calendar=_NeverExplainedFakeCalendar())
+    assert trusted.continuity_certification.status is CertificationStatus.FAILED
+    with pytest.raises(ResearchPolicyError):
+        ResearchReadyDataset.build(trusted, ResearchDataPolicy(require_continuity_certified=True))
+
+
+def test_session_certified_passes_when_required(tmp_path):
+    ds, fetch = _two_minute_dataset(tmp_path)
+    trusted = _write_and_read_trusted(tmp_path, ds, fetch, calendar=_AlwaysExplainedFakeCalendar())
+    assert trusted.session_certification.status is CertificationStatus.CERTIFIED
+    ResearchReadyDataset.build(trusted, ResearchDataPolicy(require_session_certified=True))
+
+
+def test_session_not_certified_fails_when_required(tmp_path):
+    trusted = _one_day_trusted(tmp_path)  # default NullCalendar
+    assert trusted.session_certification.status is CertificationStatus.NOT_CERTIFIED
+    with pytest.raises(ResearchPolicyError):
+        ResearchReadyDataset.build(trusted, ResearchDataPolicy(require_session_certified=True))
+
+
+def test_session_failed_fails_when_required(tmp_path):
+    ds, fetch = _two_minute_dataset(tmp_path)
+    trusted = _write_and_read_trusted(tmp_path, ds, fetch, calendar=_NoValidBarFakeCalendar())
+    assert trusted.session_certification.status is CertificationStatus.FAILED
+    with pytest.raises(ResearchPolicyError):
+        ResearchReadyDataset.build(trusted, ResearchDataPolicy(require_session_certified=True))
+
+
+def test_multiple_certification_failures_reported_together(tmp_path):
+    trusted = _one_day_trusted(tmp_path)  # NullCalendar: both NOT_CERTIFIED
+    with pytest.raises(ResearchPolicyError) as excinfo:
+        ResearchReadyDataset.build(
+            trusted,
+            ResearchDataPolicy(
+                require_continuity_certified=True, require_session_certified=True
+            ),
+        )
+    assert len(excinfo.value.unmet_requirements) == 2
+
+
+def test_require_reproducibility_certified_still_not_available(tmp_path):
+    trusted = _one_day_trusted(tmp_path)
+    with pytest.raises(ResearchPolicyError) as excinfo:
+        ResearchReadyDataset.build(
+            trusted, ResearchDataPolicy(require_reproducibility_certified=True)
+        )
+    assert any(
+        "reproducibility" in reason and "NOT AVAILABLE" in reason
+        for reason in excinfo.value.unmet_requirements
+    )
+
+
+# ---------------------------------------------------------------------------
+# Critical separation tests (manager section 8, B/C/D): artifact trust and
+# research suitability are separate questions.
+# ---------------------------------------------------------------------------
+
+
+def _90_day_gap_dataset():
+    ts1 = pd.Timestamp("2026-01-01 09:15", tz=IST_NAME)
+    ts2 = pd.Timestamp("2026-04-01 09:15", tz=IST_NAME)
+    raw = pd.DataFrame(
+        [
+            {TS: ts1, OPEN: 100.0, HIGH: 105.0, LOW: 95.0, CLOSE: 101.0, VOLUME: 1000},
+            {TS: ts2, OPEN: 101.0, HIGH: 106.0, LOW: 96.0, CLOSE: 102.0, VOLUME: 1001},
+        ]
+    )
+    return ValidatedDataset.build(raw, identity=_identity())
+
+
+def test_B_sound_artifact_but_policy_requires_continuity_fails(tmp_path):
+    ds = _90_day_gap_dataset()
+    fetch = _fetch_covering(ds, "2026-01-01", "2026-04-01")
+    trusted = _write_and_read_trusted(tmp_path, ds, fetch)  # NullCalendar
+    assert trusted.market_data_validity.value == "VALID"
+    with pytest.raises(ResearchPolicyError):
+        ResearchReadyDataset.build(trusted, ResearchDataPolicy(require_continuity_certified=True))
+
+
+def test_C_fake_calendar_explains_large_gap_policy_passes(tmp_path):
+    ds = _90_day_gap_dataset()
+    fetch = _fetch_covering(ds, "2026-01-01", "2026-04-01")
+    trusted = _write_and_read_trusted(
+        tmp_path, ds, fetch, calendar=_NinetyDayExplainedFakeCalendar()
+    )
+    assert trusted.continuity_certification.status is CertificationStatus.CERTIFIED
+    ResearchReadyDataset.build(trusted, ResearchDataPolicy(require_continuity_certified=True))
+
+
+def test_D_fake_calendar_says_transition_wrong_artifact_still_exists_but_policy_fails(tmp_path):
+    ds = _90_day_gap_dataset()
+    fetch = _fetch_covering(ds, "2026-01-01", "2026-04-01")
+    trusted = _write_and_read_trusted(tmp_path, ds, fetch, calendar=_NeverExplainedFakeCalendar())
+    # The TrustedDataset still exists -- artifact trust is unaffected.
+    assert trusted.market_data_validity.value == "VALID"
+    assert trusted.continuity_certification.status is CertificationStatus.FAILED
+    with pytest.raises(ResearchPolicyError):
+        ResearchReadyDataset.build(trusted, ResearchDataPolicy(require_continuity_certified=True))

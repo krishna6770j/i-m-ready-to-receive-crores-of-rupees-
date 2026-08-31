@@ -214,15 +214,28 @@ def test_cross_day_gap_reports_magnitude_when_no_calendar_configured():
     assert "WITHIN_DAY_GAPS" not in codes(report)
 
 
-def test_multi_month_hole_is_an_error_even_without_a_calendar():
-    """A four-month hole is missing data under any calendar. THE key regression."""
+# ---------------------------------------------------------------------------
+# Unit 13B: elapsed gap size, BY ITSELF, must never make MarketDataValidity
+# INVALID. Continuity meaning now belongs entirely to
+# marketdata.continuity.certify_continuity() with an actual TradingCalendar.
+# ---------------------------------------------------------------------------
+
+
+def test_no_absurd_gap_days_constant_remains():
+    import marketdata.validator as validator_module
+
+    assert not hasattr(validator_module, "ABSURD_GAP_DAYS")
+
+
+def test_multi_month_hole_is_not_an_error_from_duration_alone():
+    """A four-month hole used to be an automatic ERROR (IMPLAUSIBLE_DATA_GAP).
+    Elapsed size alone must never decide validity now."""
     report = run(_two_blocks("2026-01-05", "2026-05-05"), expected_interval_minutes=1)
-    assert "IMPLAUSIBLE_DATA_GAP" in codes(report)
-    assert not report.is_usable, "a four-month hole must not be classified usable"
+    assert "IMPLAUSIBLE_DATA_GAP" not in codes(report)
+    assert report.is_usable, "a large gap must not, by itself, make data unusable"
 
 
 def test_overnight_gap_is_not_an_implausible_gap():
-    """The absurdity ceiling must not fire on ordinary breaks."""
     report = run(_two_blocks("2026-01-01", "2026-01-02"), expected_interval_minutes=1)
     assert "IMPLAUSIBLE_DATA_GAP" not in codes(report)
     assert report.is_usable
@@ -234,26 +247,67 @@ def test_weekend_gap_is_not_an_implausible_gap():
     assert report.is_usable
 
 
-def test_configured_calendar_flags_excessive_gap_as_error():
-    """With a calendar bound, gaps beyond it are ERRORs."""
+def test_29_day_gap_not_error_from_duration_alone():
+    report = run(_two_blocks("2026-01-05", "2026-02-03"), expected_interval_minutes=1)
+    assert report.is_usable
+    assert not report.errors
+
+
+def test_31_day_gap_not_error_from_duration_alone():
+    report = run(_two_blocks("2026-01-05", "2026-02-05"), expected_interval_minutes=1)
+    assert report.is_usable
+    assert not report.errors
+
+
+def test_90_day_gap_not_error_from_duration_alone():
+    report = run(_two_blocks("2026-01-05", "2026-04-05"), expected_interval_minutes=1)
+    assert report.is_usable
+    assert not report.errors
+
+
+def test_180_day_gap_not_error_from_duration_alone():
+    report = run(_two_blocks("2026-01-05", "2026-07-04"), expected_interval_minutes=1)
+    assert report.is_usable
+    assert not report.errors
+
+
+def test_configured_legacy_threshold_does_not_turn_multiday_gap_into_error():
+    """max_session_gap_days=1 previously made any larger gap an ERROR
+    (EXCESSIVE_DATA_GAP). It must now be non-gating."""
+    report = run(
+        _two_blocks("2026-01-05", "2026-01-12"),
+        expected_interval_minutes=1,
+        max_session_gap_days=1,
+    )
+    assert "EXCESSIVE_DATA_GAP" not in codes(report)
+    assert report.is_usable
+    assert not report.errors
+
+
+def test_legacy_field_produces_explicit_non_gating_evidence():
     report = run(
         _two_blocks("2026-01-05", "2026-01-12"),
         expected_interval_minutes=1,
         max_session_gap_days=4,
     )
-    assert "EXCESSIVE_DATA_GAP" in codes(report)
-    assert not report.is_usable
-    assert "TRADING_CALENDAR_NOT_CONFIGURED" not in codes(report)
-
-
-def test_configured_calendar_accepts_gap_within_limit():
-    report = run(
-        _two_blocks("2026-01-02", "2026-01-05"),
-        expected_interval_minutes=1,
-        max_session_gap_days=4,
+    assert "LEGACY_MAX_SESSION_GAP_POLICY_NON_GATING" in codes(report)
+    issue = next(
+        i for i in report.issues if i.code == "LEGACY_MAX_SESSION_GAP_POLICY_NON_GATING"
     )
-    assert "EXCESSIVE_DATA_GAP" not in codes(report)
+    assert issue.severity is Severity.WARNING
+    assert "no longer gates" in issue.message
+    assert "TRADING_CALENDAR_NOT_CONFIGURED" not in codes(report)
     assert report.is_usable
+
+
+def test_ordinary_ohlc_error_still_makes_data_invalid():
+    """Removing the arbitrary gap rule must not weaken actual price/schema
+    checks: a genuine OHLC violation still makes MarketDataValidity INVALID."""
+    frame = make_ohlcv(3, start="2026-01-01 09:15")
+    frame.loc[0, "high"] = frame.loc[0, "low"] - 10  # high < low: impossible
+    report = run(frame, expected_interval_minutes=1)
+    assert not report.is_usable
+    assert report.errors
 
 
 def test_session_window_check_is_skipped_when_not_supplied(ohlcv):

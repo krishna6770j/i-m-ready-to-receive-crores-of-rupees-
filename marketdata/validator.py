@@ -33,12 +33,6 @@ from marketdata.schemas import (
 
 MAX_SAMPLES = 5
 
-# Gaps larger than this are treated as missing data regardless of whether a
-# trading calendar is configured. This is deliberately NOT an exchange calendar
-# rule: it is an absurdity ceiling. No equity market closes for a month, so a
-# gap this large cannot be a legitimate session break.
-ABSURD_GAP_DAYS = 30
-
 
 class Severity(str, Enum):
     """How seriously to take an issue.
@@ -190,11 +184,17 @@ def validate(
             and recorded as skipped -- NSE session boundaries changed on
             2026-08-03 and the exact windows differ by segment and remain
             unconfirmed, so guessing them would manufacture false failures.
-        max_session_gap_days: Largest cross-day gap considered legitimate for
-            this instrument's calendar. When None, cross-day gaps are reported
-            with their magnitude as a WARNING stating that no calendar is
-            configured, rather than being assumed expected. Gaps beyond
-            ABSURD_GAP_DAYS are an ERROR either way.
+        max_session_gap_days: LEGACY, schema-v1-compatibility field only.
+            Elapsed calendar-day gap size, by itself, can NEVER make
+            MarketDataValidity INVALID -- gap MEANING (explained by a
+            calendar, or not) now belongs entirely to
+            ``marketdata.continuity.certify_continuity``, which requires an
+            actual ``TradingCalendar`` rather than a bare day-count. When
+            this field is supplied and cross-day gaps exist, a WARNING
+            records that it is present but NON-GATING; when it is None,
+            cross-day gaps are reported with their magnitude as a WARNING
+            stating that no calendar is configured. Neither branch ever
+            produces an ERROR from gap size alone.
     """
     has_ts = TS in frame.columns
     tz_attr = getattr(frame[TS].dtype, "tz", None) if has_ts else None
@@ -456,37 +456,33 @@ def validate(
                     )
                 )
             else:
-                excessive = overnight & (
+                # LEGACY, schema-v1-compatibility field only (frozen
+                # architecture section 19): elapsed gap size, by itself,
+                # must NEVER make MarketDataValidity INVALID. This field is
+                # retained only because it is already serialised in
+                # provenance schema v1 -- it no longer gates anything.
+                # Gap MEANING now belongs entirely to
+                # marketdata.continuity.certify_continuity(), which
+                # requires an actual TradingCalendar rather than a bare
+                # day-count threshold.
+                exceeding = overnight & (
                     deltas > pd.Timedelta(days=max_session_gap_days)
                 )
-                if excessive.any():
-                    report.add(
-                        ValidationIssue(
-                            "EXCESSIVE_DATA_GAP",
-                            Severity.ERROR,
-                            f"{int(excessive.sum())} gap(s) exceed the configured "
-                            f"maximum of {max_session_gap_days} calendar days; "
-                            f"largest spans {largest:.1f} days.",
-                            count=int(excessive.sum()),
-                            samples=_samples(frame.loc[excessive, TS]),
-                        )
-                    )
-
-            # Absurdity ceiling, applied regardless of configuration. This does
-            # not encode any exchange's calendar: no equity market closes for a
-            # month, so a gap this large is missing data by construction.
-            absurd = overnight & (deltas > pd.Timedelta(days=ABSURD_GAP_DAYS))
-            if absurd.any():
                 report.add(
                     ValidationIssue(
-                        "IMPLAUSIBLE_DATA_GAP",
-                        Severity.ERROR,
-                        f"{int(absurd.sum())} gap(s) exceed {ABSURD_GAP_DAYS} "
-                        f"calendar days; largest spans {largest:.1f} days. No "
-                        "equity market closes this long, so this is missing "
-                        "data irrespective of any trading calendar.",
-                        count=int(absurd.sum()),
-                        samples=_samples(frame.loc[absurd, TS]),
+                        "LEGACY_MAX_SESSION_GAP_POLICY_NON_GATING",
+                        Severity.WARNING,
+                        f"{int(overnight.sum())} cross-day gap(s); largest spans "
+                        f"{largest:.1f} calendar days. max_session_gap_days="
+                        f"{max_session_gap_days} is set ({int(exceeding.sum())} "
+                        "gap(s) would have exceeded it), but this field is "
+                        "retained for schema-v1 compatibility only and no "
+                        "longer gates MarketDataValidity -- elapsed gap size "
+                        "alone can never make data INVALID. Use "
+                        "marketdata.continuity.certify_continuity() with a "
+                        "configured TradingCalendar to certify continuity.",
+                        count=int(overnight.sum()),
+                        samples=_samples(frame.loc[overnight, TS]),
                     )
                 )
 

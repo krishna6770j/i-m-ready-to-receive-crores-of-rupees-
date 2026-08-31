@@ -690,3 +690,165 @@ def hashlib_sha256_of(data_digest_hex: str, provenance_digest_hex: str) -> str:
     return hashlib.sha256(
         bytes.fromhex(data_digest_hex) + bytes.fromhex(provenance_digest_hex)
     ).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Unit 13B: calendar certification integration. Continuity/session
+# certifications are ATTACHED FACTS -- they never decide whether
+# read_trusted() accepts a generation.
+# ---------------------------------------------------------------------------
+
+from marketdata.continuity import (
+    CertificationStatus,
+    NullCalendar,
+)
+from marketdata.schemas import empty_ohlcv
+
+
+class _AlwaysExplainedFakeCalendar:
+    """Obviously-fake test-only calendar: every transition is EXPLAINED and
+    every candle is a valid session bar, regardless of elapsed size. NOT
+    NSE -- never imported by production code.
+    """
+
+    calendar_id = "fake-always-explained"
+    calendar_version = "1"
+
+    def is_session_day(self, day) -> bool:
+        return True
+
+    def is_valid_bar(self, ts, resolution) -> bool:
+        return True
+
+    def expected_next_bar(self, ts, resolution):
+        if resolution == "1D":
+            return ts + pd.Timedelta(days=1)
+        return ts + pd.Timedelta(minutes=int(resolution))
+
+
+class _NeverExplainedFakeCalendar(_AlwaysExplainedFakeCalendar):
+    """Obviously-fake test-only calendar: claims every transition is wrong
+    (always UNEXPLAINED). NOT NSE.
+    """
+
+    calendar_id = "fake-never-explained"
+
+    def expected_next_bar(self, ts, resolution):
+        return ts + pd.Timedelta(days=999)
+
+
+class _NoValidBarFakeCalendar(_AlwaysExplainedFakeCalendar):
+    """Obviously-fake test-only calendar: every candle fails is_valid_bar.
+    NOT NSE.
+    """
+
+    calendar_id = "fake-no-valid-bar"
+
+    def is_valid_bar(self, ts, resolution) -> bool:
+        return False
+
+
+def _two_candle_frame(date1: str, date2: str, *, same_day_minute_offset: int = 1) -> pd.DataFrame:
+    ts1 = pd.Timestamp(f"{date1} 09:15", tz=IST_NAME)
+    if date1 == date2:
+        ts2 = ts1 + pd.Timedelta(minutes=same_day_minute_offset)
+    else:
+        ts2 = pd.Timestamp(f"{date2} 09:15", tz=IST_NAME)
+    return pd.DataFrame(
+        [
+            {TS: ts1, OPEN: 100.0, HIGH: 105.0, LOW: 95.0, CLOSE: 101.0, VOLUME: 1000},
+            {TS: ts2, OPEN: 101.0, HIGH: 106.0, LOW: 96.0, CLOSE: 102.0, VOLUME: 1001},
+        ]
+    )
+
+
+def _write_and_read_trusted(root, ds, fetch, *, calendar=None):
+    env = ProvenanceEnvelope.build(ds, fetch=fetch)
+    write_generation(ds, env, root)
+    kwargs = {}
+    if calendar is not None:
+        kwargs["calendar"] = calendar
+    return read_trusted(
+        root,
+        source=ds.identity.source,
+        symbol=ds.identity.symbol,
+        resolution=ds.identity.resolution,
+        **kwargs,
+    )
+
+
+def test_default_read_trusted_uses_null_calendar_certifications(tmp_path):
+    ds, env, _ = _write_trusted(tmp_path)
+    trusted = read_trusted(tmp_path, source="fyers:history", symbol="NIFTY", resolution="1")
+    assert trusted.continuity_certification.status is CertificationStatus.NOT_CERTIFIED
+    assert trusted.session_certification.status is CertificationStatus.NOT_CERTIFIED
+    assert trusted.continuity_certification.calendar_id == "null"
+    assert trusted.session_certification.calendar_id == "null"
+
+
+def test_configured_fake_calendar_certification_attached(tmp_path):
+    ds = ValidatedDataset.build(_two_candle_frame("2026-01-01", "2026-01-01"), identity=_identity())
+    fetch = _fetch_for(ds, requested_from="2026-01-01", requested_to="2026-01-01")
+    trusted = _write_and_read_trusted(tmp_path, ds, fetch, calendar=_AlwaysExplainedFakeCalendar())
+    assert trusted.continuity_certification.status is CertificationStatus.CERTIFIED
+    assert trusted.session_certification.status is CertificationStatus.CERTIFIED
+    assert trusted.continuity_certification.calendar_id == "fake-always-explained"
+    assert trusted.session_certification.calendar_id == "fake-always-explained"
+
+
+def test_failed_certification_does_not_reject_trusted_artifact(tmp_path):
+    ds = ValidatedDataset.build(
+        _two_candle_frame("2026-01-01", "2026-04-01"), identity=_identity()
+    )
+    fetch = _fetch_for(ds, requested_from="2026-01-01", requested_to="2026-04-01")
+    # read_trusted() must SUCCEED even though the calendar reports FAILED.
+    trusted = _write_and_read_trusted(tmp_path, ds, fetch, calendar=_NeverExplainedFakeCalendar())
+    assert trusted.market_data_validity.value == "VALID"
+    assert trusted.continuity_certification.status is CertificationStatus.FAILED
+
+
+def test_not_certified_certification_does_not_reject_trusted_artifact(tmp_path):
+    ds, env, _ = _write_trusted(tmp_path)
+    # NullCalendar (default) always produces NOT_CERTIFIED -- construction
+    # must still succeed.
+    trusted = read_trusted(tmp_path, source="fyers:history", symbol="NIFTY", resolution="1")
+    assert trusted.market_data_validity.value == "VALID"
+    assert trusted.continuity_certification.status is CertificationStatus.NOT_CERTIFIED
+    assert trusted.session_certification.status is CertificationStatus.NOT_CERTIFIED
+
+
+def test_certifications_reference_correct_calendar_identity(tmp_path):
+    ds = ValidatedDataset.build(_two_candle_frame("2026-01-01", "2026-01-01"), identity=_identity())
+    fetch = _fetch_for(ds, requested_from="2026-01-01", requested_to="2026-01-01")
+    trusted = _write_and_read_trusted(tmp_path, ds, fetch, calendar=_AlwaysExplainedFakeCalendar())
+    assert trusted.continuity_certification.calendar_version == "1"
+    assert trusted.session_certification.calendar_version == "1"
+
+
+def test_trusted_dataset_defensive_behavior_unchanged_with_certifications(tmp_path):
+    ds, env, _ = _write_trusted(tmp_path)
+    trusted = read_trusted(tmp_path, source="fyers:history", symbol="NIFTY", resolution="1")
+    first = trusted.frame
+    first.loc[0, CLOSE] = 999999.0
+    second = trusted.frame
+    assert second.loc[0, CLOSE] != 999999.0
+    with pytest.raises(AttributeError):
+        trusted.continuity_certification = None
+    with pytest.raises(TypeError):
+        import pickle
+
+        pickle.dumps(trusted)
+
+
+# --- Critical separation test A (manager section 8) -------------------------
+
+
+def test_critical_A_90_day_gap_null_calendar_sound_but_uncertified(tmp_path):
+    ds = ValidatedDataset.build(
+        _two_candle_frame("2026-01-01", "2026-04-01"), identity=_identity()
+    )
+    fetch = _fetch_for(ds, requested_from="2026-01-01", requested_to="2026-04-01")
+    trusted = _write_and_read_trusted(tmp_path, ds, fetch)  # NullCalendar (default)
+    assert trusted.market_data_validity.value == "VALID"
+    assert trusted.continuity_certification.status is CertificationStatus.NOT_CERTIFIED
+    assert trusted.session_certification.status is CertificationStatus.NOT_CERTIFIED

@@ -319,11 +319,15 @@ def test_default_validation_policy_matches_validate_defaults():
     assert ds.validation_policy == ValidationPolicy()
 
 
-def test_different_max_session_gap_days_can_change_validity_same_digest():
-    # A gap larger than a strict max_session_gap_days is an ERROR
-    # (EXCESSIVE_DATA_GAP); the same gap under a lenient/unset policy is not
-    # necessarily an ERROR. Same frame + identity -> same data_digest either
-    # way, since the policy is not part of identity.
+def test_max_session_gap_days_no_longer_gates_validity_same_digest():
+    # Per Unit 13B: max_session_gap_days is retained on ValidationPolicy
+    # only for schema-v1 compatibility -- elapsed gap size, by itself, can
+    # never make MarketDataValidity INVALID anymore. A gap that would
+    # previously have been an ERROR (EXCESSIVE_DATA_GAP) under a strict
+    # policy is now VALID either way, with the legacy field's presence
+    # recorded as a non-gating WARNING instead. Same frame + identity ->
+    # same data_digest regardless of policy, since the policy is not part
+    # of identity.
     ts0 = pd.Timestamp("2026-01-01 09:15", tz=IST_NAME)
     raw = pd.DataFrame(
         {
@@ -352,8 +356,14 @@ def test_different_max_session_gap_days_can_change_validity_same_digest():
 
     assert lenient.digest == strict.digest
     assert lenient.market_data_validity == MarketDataValidity.VALID
-    assert strict.market_data_validity == MarketDataValidity.INVALID
-    assert "EXCESSIVE_DATA_GAP" in {i.code for i in strict.validation.errors}
+    assert strict.market_data_validity == MarketDataValidity.VALID
+    assert "EXCESSIVE_DATA_GAP" not in {i.code for i in strict.validation.issues}
+    assert "LEGACY_MAX_SESSION_GAP_POLICY_NON_GATING" in {
+        i.code for i in strict.validation.issues
+    }
+    assert "TRADING_CALENDAR_NOT_CONFIGURED" in {
+        i.code for i in lenient.validation.issues
+    }
 
 
 # --- report generated internally, never accepted as a parameter ------------
