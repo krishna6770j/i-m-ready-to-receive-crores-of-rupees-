@@ -645,16 +645,33 @@ def test_non_data_coarse_windows_are_never_subdivided():
         assert day not in subdivided_ranges
 
 
+class _OnlyJan2HasACandleClient:
+    """A window's response reflects the SAME underlying reality regardless
+    of which window (coarse or subdivision) asks: the only candle that
+    exists anywhere is on Jan 2. A window covering Jan 2 sees it; a window
+    that does not, sees nothing. This is what makes the coarse Jan1..Jan2
+    window and the Jan1-only/Jan2-only subdivisions mutually consistent --
+    unlike scripting a response purely from the window's own start date,
+    which would make the coarse window "invent" a Jan 1 candle its own
+    subdivision then contradicts.
+    """
+
+    def __init__(self):
+        self.requests: list[dict] = []
+
+    def history(self, data=None):
+        self.requests.append(dict(data or {}))
+        end = date.fromisoformat(data["range_to"])
+        if end < date(2026, 1, 2):
+            return {"s": "ok", "candles": []}
+        return candles_payload(1, start_epoch=_epoch_for(date(2026, 1, 2)))
+
+
 def test_actual_candle_date_not_window_start_becomes_earliest_observed_date():
     """Critical example from the manager: a subdivided window of Jan1..Jan2
     whose first ACTUAL candle is Jan 2 09:15 must report earliest_observed_date
     == Jan 2, never Jan 1 (the requested window start)."""
-    def classify(start, end):
-        if start == date(2026, 1, 1) and end == date(2026, 1, 1):
-            return "empty"  # no candle on Jan 1 itself
-        return "data"
-
-    client = ScriptedClient(classify)
+    client = _OnlyJan2HasACandleClient()
     prov = FyersHistoricalData(client, request_pause_seconds=0.0)
     report = prov.probe_history_depth(
         "X", "1", newest=date(2026, 1, 2), oldest_to_try=date(2026, 1, 1),
@@ -755,3 +772,128 @@ def test_report_has_no_unproven_certainty_fields():
     )
     for name in forbidden:
         assert not hasattr(report, name)
+
+
+# ---------------------------------------------------------------------------
+# Evidence-preservation during subdivision: subdivision may only TIGHTEN
+# the earliest-observed bracket by adding genuine new information; it must
+# never ERASE a candle already genuinely observed in the coarse request.
+# ---------------------------------------------------------------------------
+
+
+class _CellClient:
+    """Exact per-window scripted responses, keyed by the literal
+    (range_from, range_to) request pair, so each test can control the
+    coarse window's own observed evidence independently of what its
+    subdivisions later report.
+    """
+
+    def __init__(self, cells: dict):
+        self._cells = cells
+        self.requests: list[dict] = []
+
+    def history(self, data=None):
+        self.requests.append(dict(data or {}))
+        key = (data["range_from"], data["range_to"])
+        status, candle_date = self._cells[key]
+        if status == "data":
+            return candles_payload(1, start_epoch=_epoch_for(candle_date))
+        if status == "empty":
+            return {"s": "ok", "candles": []}
+        if status == "error":
+            return {"s": "error", "message": "internal server error", "code": -50}
+        raise AssertionError(key)
+
+
+def test_A_subdivision_error_on_earliest_day_never_erases_coarse_evidence():
+    """Critical regression: coarse DATA observed earliest_ts = Jan 1, but
+    subdivision's Jan-1 sub-window comes back ERROR while Jan-2 comes back
+    DATA. The genuine Jan-1 coarse observation must survive -- the report
+    must NOT jump to Jan 2 merely because the finer probe of Jan 1 failed.
+    """
+    from brokers.fyers.historical import ProbeWindowStatus
+
+    cells = {
+        ("2026-01-01", "2026-01-02"): ("data", date(2026, 1, 1)),  # coarse
+        ("2026-01-01", "2026-01-01"): ("error", None),             # subdivision
+        ("2026-01-02", "2026-01-02"): ("data", date(2026, 1, 2)),  # subdivision
+    }
+    client = _CellClient(cells)
+    prov = FyersHistoricalData(client, request_pause_seconds=0.0)
+    report = prov.probe_history_depth(
+        "X", "1", newest=date(2026, 1, 2), oldest_to_try=date(2026, 1, 1),
+        coarse_window_days=2, subdivision_resolution_days=1,
+    )
+    assert report.earliest_observed_date == "2026-01-01"
+    jan1_sub = [
+        w for w in report.unresolved_intervals
+        if w.range_from == "2026-01-01" and w.range_to == "2026-01-01"
+    ]
+    assert len(jan1_sub) == 1
+    assert jan1_sub[0].status is ProbeWindowStatus.ERROR
+
+
+def test_B_coarse_and_all_subdivisions_agree_on_earliest_day():
+    cells = {
+        ("2026-01-01", "2026-01-02"): ("data", date(2026, 1, 1)),
+        ("2026-01-01", "2026-01-01"): ("data", date(2026, 1, 1)),
+        ("2026-01-02", "2026-01-02"): ("data", date(2026, 1, 2)),
+    }
+    client = _CellClient(cells)
+    prov = FyersHistoricalData(client, request_pause_seconds=0.0)
+    report = prov.probe_history_depth(
+        "X", "1", newest=date(2026, 1, 2), oldest_to_try=date(2026, 1, 1),
+        coarse_window_days=2, subdivision_resolution_days=1,
+    )
+    assert report.earliest_observed_date == "2026-01-01"
+
+
+def test_C_subdivision_may_tighten_to_an_even_earlier_real_candle():
+    """The coarse response's own (fake) earliest_ts is Jan 2, but a
+    subdivision sub-window genuinely observes an earlier candle on Jan 1.
+    Subdivision ADDING earlier evidence is legitimate tightening -- the
+    final result must reflect the earliest evidence across BOTH sources.
+    """
+    cells = {
+        ("2026-01-01", "2026-01-02"): ("data", date(2026, 1, 2)),
+        ("2026-01-01", "2026-01-01"): ("data", date(2026, 1, 1)),
+        ("2026-01-02", "2026-01-02"): ("data", date(2026, 1, 2)),
+    }
+    client = _CellClient(cells)
+    prov = FyersHistoricalData(client, request_pause_seconds=0.0)
+    report = prov.probe_history_depth(
+        "X", "1", newest=date(2026, 1, 2), oldest_to_try=date(2026, 1, 1),
+        coarse_window_days=2, subdivision_resolution_days=1,
+    )
+    assert report.earliest_observed_date == "2026-01-01"
+
+
+def test_D_no_subdivision_data_at_all_retains_coarse_evidence():
+    cells = {
+        ("2026-01-01", "2026-01-02"): ("data", date(2026, 1, 1)),
+        ("2026-01-01", "2026-01-01"): ("error", None),
+        ("2026-01-02", "2026-01-02"): ("error", None),
+    }
+    client = _CellClient(cells)
+    prov = FyersHistoricalData(client, request_pause_seconds=0.0)
+    report = prov.probe_history_depth(
+        "X", "1", newest=date(2026, 1, 2), oldest_to_try=date(2026, 1, 1),
+        coarse_window_days=2, subdivision_resolution_days=1,
+    )
+    assert report.earliest_observed_date == "2026-01-01"
+    assert report.earliest_observed_candle.startswith("2026-01-01")
+
+
+def test_E_subdivision_all_empty_success_retains_coarse_evidence():
+    cells = {
+        ("2026-01-01", "2026-01-02"): ("data", date(2026, 1, 1)),
+        ("2026-01-01", "2026-01-01"): ("empty", None),
+        ("2026-01-02", "2026-01-02"): ("empty", None),
+    }
+    client = _CellClient(cells)
+    prov = FyersHistoricalData(client, request_pause_seconds=0.0)
+    report = prov.probe_history_depth(
+        "X", "1", newest=date(2026, 1, 2), oldest_to_try=date(2026, 1, 1),
+        coarse_window_days=2, subdivision_resolution_days=1,
+    )
+    assert report.earliest_observed_date == "2026-01-01"

@@ -492,15 +492,21 @@ class FyersHistoricalData(HistoricalDataProvider):
 
         all_windows = tuple(coarse_windows) + tuple(subdivision_windows)
 
-        # Earliest observed candle: prefer the finer subdivision evidence;
-        # fall back to the coarse DATA window's own already-real candle
-        # timestamp if subdivision produced no DATA window itself (e.g. the
-        # sub-window actually containing the earliest candle came back
-        # ERROR). Both sources are genuine returned-candle timestamps, never
-        # a requested window's start date.
+        # Earliest observed candle: the UNION of every successful DATA
+        # observation relevant to the oldest region -- the coarse
+        # oldest_data_window itself, PLUS every DATA subdivision window.
+        # Subdivision may only TIGHTEN this value when it adds genuine new
+        # information (a DATA sub-window with an even earlier real candle);
+        # it must never ERASE a candle already genuinely observed in the
+        # coarse request merely because a finer request covering that same
+        # instant came back ERROR/EMPTY_SUCCESS. A failed finer probe
+        # reduces precision, not evidence -- it is recorded in
+        # unresolved_intervals, never used to invalidate a timestamp this
+        # scan already actually saw. Both sources are genuine
+        # returned-candle timestamps, never a requested window's start date.
         data_candidates = [w for w in subdivision_windows if w.status is ProbeWindowStatus.DATA]
-        if not data_candidates and oldest_data_window is not None:
-            data_candidates = [oldest_data_window]
+        if oldest_data_window is not None:
+            data_candidates = [oldest_data_window] + data_candidates
 
         earliest_observed_candle: str | None = None
         if data_candidates:
@@ -539,9 +545,13 @@ class FyersHistoricalData(HistoricalDataProvider):
         end: date,
         first_request: bool,
     ) -> tuple["ProbeWindow", bool]:
-        """Probe one window, classify it, and report whether a request was
-        actually made (so the caller can track ``first_request`` for pause
-        timing across the whole scan, coarse + subdivision combined).
+        """Probe one window and classify it. Always makes exactly one
+        request, so the returned ``bool`` is always ``False`` -- it is the
+        UPDATED ``first_request`` flag for the caller's NEXT call, not a
+        report of whether a request happened here (one always does). This
+        lets the caller track ``first_request`` for pause timing across the
+        whole scan, coarse + subdivision combined, without pausing before
+        the very first request of the entire scan.
         """
         if not first_request and self._pause:
             time.sleep(self._pause)
