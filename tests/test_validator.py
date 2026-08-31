@@ -300,6 +300,105 @@ def test_legacy_field_produces_explicit_non_gating_evidence():
     assert report.is_usable
 
 
+# ---------------------------------------------------------------------------
+# Unit 13B final correction: the no-calendar message must not recommend the
+# now-non-gating max_session_gap_days field, and a supplied legacy field must
+# never be silently ignored just because no cross-day gap happened to occur.
+# ---------------------------------------------------------------------------
+
+
+def test_no_calendar_message_does_not_recommend_max_session_gap_days():
+    report = run(_two_blocks("2026-01-01", "2026-01-02"), expected_interval_minutes=1)
+    issue = next(
+        i for i in report.issues if i.code == "TRADING_CALENDAR_NOT_CONFIGURED"
+    )
+    assert "max_session_gap_days" not in issue.message
+
+
+def test_no_calendar_message_points_to_certification():
+    report = run(_two_blocks("2026-01-01", "2026-01-02"), expected_interval_minutes=1)
+    issue = next(
+        i for i in report.issues if i.code == "TRADING_CALENDAR_NOT_CONFIGURED"
+    )
+    assert "TradingCalendar" in issue.message
+    assert "certif" in issue.message.lower()
+
+
+def test_legacy_field_supplied_with_zero_gaps_still_produces_evidence():
+    """A single-row frame has no gaps at all (deltas are all NaT), so the
+    overnight branch never runs -- the legacy field must still be reported."""
+    frame = make_ohlcv(1, start="2026-01-05 09:15")
+    report = run(frame, expected_interval_minutes=1, max_session_gap_days=4)
+    assert "LEGACY_MAX_SESSION_GAP_POLICY_NON_GATING" in codes(report)
+    assert report.is_usable
+
+
+def test_legacy_field_supplied_with_same_day_only_data_still_produces_evidence():
+    """No date change anywhere in the frame -- overnight.any() is False --
+    but the legacy field must still be reported, not silently dropped."""
+    frame = make_ohlcv(10, start="2026-01-05 09:15")
+    report = run(frame, expected_interval_minutes=1, max_session_gap_days=4)
+    assert "LEGACY_MAX_SESSION_GAP_POLICY_NON_GATING" in codes(report)
+    assert report.is_usable
+
+
+def test_legacy_field_supplied_with_cross_day_gap_emits_exactly_one_issue():
+    report = run(
+        _two_blocks("2026-01-05", "2026-01-12"),
+        expected_interval_minutes=1,
+        max_session_gap_days=4,
+    )
+    count = sum(
+        1
+        for i in report.issues
+        if i.code == "LEGACY_MAX_SESSION_GAP_POLICY_NON_GATING"
+    )
+    assert count == 1
+    assert report.is_usable
+
+
+def test_legacy_field_supplied_with_no_expected_interval_still_produces_evidence():
+    """Gap detection is skipped entirely when expected_interval_minutes is
+    None; the legacy field must still be reported, not silently dropped."""
+    frame = _two_blocks("2026-01-05", "2026-01-12")
+    report = run(frame, max_session_gap_days=4)
+    assert "LEGACY_MAX_SESSION_GAP_POLICY_NON_GATING" in codes(report)
+    assert report.is_usable
+
+
+def test_legacy_issue_severity_never_makes_report_unusable():
+    for frame, kwargs in [
+        (make_ohlcv(1, start="2026-01-05 09:15"), {}),
+        (make_ohlcv(10, start="2026-01-05 09:15"), {}),
+        (_two_blocks("2026-01-05", "2026-01-12"), {}),
+    ]:
+        report = run(
+            frame, expected_interval_minutes=1, max_session_gap_days=4, **kwargs
+        )
+        legacy = [
+            i
+            for i in report.issues
+            if i.code == "LEGACY_MAX_SESSION_GAP_POLICY_NON_GATING"
+        ]
+        assert legacy, "legacy issue must be present"
+        assert all(i.severity is Severity.WARNING for i in legacy)
+        assert report.is_usable
+
+
+def test_validity_remains_valid_with_legacy_field_and_no_gaps():
+    frame = make_ohlcv(10, start="2026-01-05 09:15")
+    report = run(frame, expected_interval_minutes=1, max_session_gap_days=4)
+    assert not report.errors
+    assert report.is_usable
+
+
+def test_forbidden_gap_error_constants_remain_absent():
+    for code in ("ABSURD_GAP_DAYS", "EXCESSIVE_DATA_GAP", "IMPLAUSIBLE_DATA_GAP"):
+        frame = _two_blocks("2026-01-05", "2026-01-12")
+        report = run(frame, expected_interval_minutes=1, max_session_gap_days=1)
+        assert code not in codes(report)
+
+
 def test_ordinary_ohlc_error_still_makes_data_invalid():
     """Removing the arbitrary gap rule must not weaken actual price/schema
     checks: a genuine OHLC violation still makes MarketDataValidity INVALID."""

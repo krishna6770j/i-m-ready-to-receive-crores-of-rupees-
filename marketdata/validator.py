@@ -389,6 +389,14 @@ def validate(
             )
         )
 
+    # Unit 13B contract: whenever max_session_gap_days is supplied, exactly
+    # one LEGACY_MAX_SESSION_GAP_POLICY_NON_GATING issue is recorded,
+    # regardless of whether any cross-day gap (or any gap at all) actually
+    # exists -- a supplied legacy field must never be silently ignored.
+    # Set True the moment it is emitted below, from whichever path reaches
+    # it first, so it is never emitted twice.
+    legacy_gap_policy_issue_emitted = False
+
     # --- minute alignment --------------------------------------------------
     if expected_interval_minutes is not None:
         seconds = frame[TS].dt.second
@@ -448,9 +456,10 @@ def validate(
                         f"{int(overnight.sum())} cross-day gap(s); largest spans "
                         f"{largest:.1f} calendar days. No trading calendar is "
                         "configured, so weekends, holidays and genuinely missing "
-                        "data CANNOT be distinguished. Supply "
-                        "max_session_gap_days once the instrument's session "
-                        "calendar is settled.",
+                        "data CANNOT be distinguished. Configure a "
+                        "TradingCalendar and use continuity/session "
+                        "certification (marketdata.continuity) when "
+                        "calendar-aware research suitability is required.",
                         count=int(overnight.sum()),
                         samples=_samples(frame.loc[overnight, TS]),
                     )
@@ -485,6 +494,42 @@ def validate(
                         samples=_samples(frame.loc[overnight, TS]),
                     )
                 )
+                legacy_gap_policy_issue_emitted = True
+
+        # Unit 13B contract: a supplied legacy field must never be silently
+        # ignored just because no cross-day gap happened to occur (or gap
+        # detection did not even run). Emit the non-gating notice regardless.
+        if max_session_gap_days is not None and not legacy_gap_policy_issue_emitted:
+            report.add(
+                ValidationIssue(
+                    "LEGACY_MAX_SESSION_GAP_POLICY_NON_GATING",
+                    Severity.WARNING,
+                    f"max_session_gap_days={max_session_gap_days} is set, but no "
+                    "cross-day gap was observed in this dataset. This field is "
+                    "retained for schema-v1 compatibility only and does not "
+                    "affect MarketDataValidity -- elapsed gap size alone can "
+                    "never make data INVALID. Use "
+                    "marketdata.continuity.certify_continuity() with a "
+                    "configured TradingCalendar to certify continuity.",
+                    count=1,
+                )
+            )
+            legacy_gap_policy_issue_emitted = True
+    if max_session_gap_days is not None and not legacy_gap_policy_issue_emitted:
+        report.add(
+            ValidationIssue(
+                "LEGACY_MAX_SESSION_GAP_POLICY_NON_GATING",
+                Severity.WARNING,
+                f"max_session_gap_days={max_session_gap_days} is set, but gap "
+                "detection was not evaluated (no expected_interval_minutes "
+                "supplied). This field is retained for schema-v1 "
+                "compatibility only and does not affect MarketDataValidity -- "
+                "use marketdata.continuity.certify_continuity() with a "
+                "configured TradingCalendar to certify continuity.",
+                count=1,
+            )
+        )
+        legacy_gap_policy_issue_emitted = True
 
     # --- session boundaries ------------------------------------------------
     if session_window is None:
