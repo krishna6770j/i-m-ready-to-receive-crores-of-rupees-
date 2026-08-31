@@ -28,6 +28,42 @@ from instruments.instrument import Instrument
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "config" / "instruments.yaml"
 
+
+class _DuplicateYamlKeyError(yaml.YAMLError):
+    """A mapping in the YAML document repeats a key.
+
+    PyYAML's default mapping construction silently keeps the LAST occurrence
+    of a duplicate key and discards earlier ones -- including an earlier,
+    genuinely invalid value someone was trying to "fix" with a second line.
+    That loss happens during YAML construction, before our schema validator
+    ever sees the document, so a duplicate key can make malformed source
+    text disappear entirely. This must be caught here, not after
+    ``safe_load`` returns, when the information is already gone.
+    """
+
+
+class _StrictSafeLoader(yaml.SafeLoader):
+    """``SafeLoader`` that rejects duplicate mapping keys at EVERY mapping
+    level (top-level document, each signal/candidate entry, and any nested
+    mapping introduced later). Otherwise identical to ``yaml.safe_load``:
+    same safety characteristics, no arbitrary object construction -- only
+    ``construct_mapping`` is overridden.
+    """
+
+    def construct_mapping(self, node, deep=False):
+        mapping: dict = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in mapping:
+                mark = key_node.start_mark
+                raise _DuplicateYamlKeyError(
+                    f"duplicate key {key!r} at line {mark.line + 1}, "
+                    f"column {mark.column + 1}"
+                )
+            value = self.construct_object(value_node, deep=deep)
+            mapping[key] = value
+        return mapping
+
 SCHEMA_VERSION = 1
 
 _TOP_LEVEL_KEYS = frozenset({"schema_version", "signal_instruments", "execution_candidates"})
@@ -429,7 +465,9 @@ def load_registry(path: str | Path | None = None) -> InstrumentRegistry:
     config_path = Path(path) if path else DEFAULT_CONFIG
     with config_path.open("r", encoding="utf-8") as fh:
         try:
-            raw = yaml.safe_load(fh)
+            raw = yaml.load(fh, Loader=_StrictSafeLoader)
+        except _DuplicateYamlKeyError as exc:
+            raise InstrumentConfigError(f"{config_path}: {exc}") from exc
         except yaml.YAMLError as exc:
             raise InstrumentConfigError(
                 f"{config_path}: could not parse YAML ({type(exc).__name__})"

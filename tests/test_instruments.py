@@ -574,3 +574,189 @@ def test_valid_config_still_loads_the_real_file():
     options = next(c for c in registry.execution_candidates if "Options" in c.name)
     assert options.instrument is None
     assert all(not c.verified for c in registry.execution_candidates)
+
+
+# ---------------------------------------------------------------------------
+# Unit 15 final hardening: YAML duplicate mapping keys must be rejected
+# during construction, not silently resolved to the last occurrence by
+# PyYAML before our schema validator ever sees the document. These tests use
+# RAW YAML TEXT (not yaml.safe_dump()) because a Python dict cannot represent
+# a duplicate key in the first place -- the defect only exists in the text.
+# ---------------------------------------------------------------------------
+
+
+_VALID_YAML = """\
+schema_version: 1
+signal_instruments:
+  - symbol: "NSE:TEST-INDEX"
+    name: "Test Index"
+    kind: index
+    role: signal
+    lot_size: 1
+    tick_size: null
+    exchange: NSE
+    notes: "a signal instrument"
+execution_candidates:
+  - symbol: "NSE:TEST-ETF"
+    name: "Test ETF"
+    kind: etf
+    role: execution
+    lot_size: 1
+    tick_size: 0.01
+    exchange: NSE
+    verified: false
+    notes: "an execution candidate"
+"""
+
+
+def _write_raw(tmp_path, text: str):
+    path = tmp_path / "instruments.yaml"
+    path.write_text(text)
+    return path
+
+
+def test_duplicate_schema_version_rejected(tmp_path):
+    """Adversarial test A."""
+    text = "schema_version: 1\nschema_version: 1\n" + _VALID_YAML.split("\n", 1)[1]
+    with pytest.raises(InstrumentConfigError, match="duplicate key"):
+        load_registry(_write_raw(tmp_path, text))
+
+
+def test_duplicate_signal_instruments_top_level_key_rejected(tmp_path):
+    """Adversarial test B."""
+    text = (
+        "schema_version: 1\n"
+        "signal_instruments: []\n"
+        "signal_instruments: []\n"
+        "execution_candidates: []\n"
+    )
+    with pytest.raises(InstrumentConfigError, match="duplicate key"):
+        load_registry(_write_raw(tmp_path, text))
+
+
+def test_duplicate_lot_size_in_signal_entry_rejected(tmp_path):
+    """Adversarial test C."""
+    text = """\
+schema_version: 1
+signal_instruments:
+  - symbol: "NSE:TEST-INDEX"
+    name: "Test Index"
+    kind: index
+    role: signal
+    lot_size: 1
+    lot_size: 1
+    tick_size: null
+    exchange: NSE
+    notes: "x"
+execution_candidates: []
+"""
+    with pytest.raises(InstrumentConfigError, match="duplicate key"):
+        load_registry(_write_raw(tmp_path, text))
+
+
+def test_duplicate_lot_size_invalid_first_value_never_vanishes(tmp_path):
+    """Adversarial test D. Critical regression: the invalid first value
+    (0) must not silently disappear in favour of the second (1) -- the
+    whole config must be rejected instead."""
+    text = """\
+schema_version: 1
+signal_instruments: []
+execution_candidates:
+  - symbol: "NSE:TEST-ETF"
+    name: "Test ETF"
+    kind: etf
+    role: execution
+    lot_size: 0
+    lot_size: 1
+    tick_size: 0.01
+    exchange: NSE
+    verified: true
+    notes: "x"
+"""
+    with pytest.raises(InstrumentConfigError, match="duplicate key"):
+        load_registry(_write_raw(tmp_path, text))
+
+
+def test_duplicate_verified_first_string_false_never_vanishes(tmp_path):
+    """Adversarial test E. Critical regression: "false" (a string, invalid)
+    must not silently disappear in favour of the second, valid `false`."""
+    text = """\
+schema_version: 1
+signal_instruments: []
+execution_candidates:
+  - symbol: "NSE:TEST-ETF"
+    name: "Test ETF"
+    kind: etf
+    role: execution
+    lot_size: 1
+    tick_size: 0.01
+    exchange: NSE
+    verified: "false"
+    verified: false
+    notes: "x"
+"""
+    with pytest.raises(InstrumentConfigError, match="duplicate key"):
+        load_registry(_write_raw(tmp_path, text))
+
+
+def test_duplicate_symbol_in_one_candidate_mapping_rejected(tmp_path):
+    """Adversarial test F."""
+    text = """\
+schema_version: 1
+signal_instruments: []
+execution_candidates:
+  - symbol: "NSE:TEST-ETF"
+    symbol: "NSE:TEST-ETF-2"
+    name: "Test ETF"
+    kind: etf
+    role: execution
+    lot_size: 1
+    tick_size: 0.01
+    exchange: NSE
+    verified: false
+    notes: "x"
+"""
+    with pytest.raises(InstrumentConfigError, match="duplicate key"):
+        load_registry(_write_raw(tmp_path, text))
+
+
+def test_duplicate_unknown_field_rejected_during_parse(tmp_path):
+    """Adversarial test G: a duplicated field that isn't even in the schema
+    allowlist must still be caught at parse time, before schema validation
+    ever runs."""
+    text = """\
+schema_version: 1
+signal_instruments: []
+execution_candidates:
+  - symbol: "NSE:TEST-ETF"
+    name: "Test ETF"
+    kind: etf
+    role: execution
+    lot_size: 1
+    tick_size: 0.01
+    exchange: NSE
+    verified: false
+    margin_pct: 0.1
+    margin_pct: 0.2
+    notes: "x"
+"""
+    with pytest.raises(InstrumentConfigError, match="duplicate key"):
+        load_registry(_write_raw(tmp_path, text))
+
+
+def test_ordinary_valid_config_still_loads_unchanged(tmp_path):
+    """Adversarial test H."""
+    registry = load_registry(_write_raw(tmp_path, _VALID_YAML))
+    assert registry.signal("NSE:TEST-INDEX").kind is InstrumentKind.INDEX
+    candidate = registry.execution_candidates[0]
+    assert candidate.instrument is not None
+    assert candidate.instrument.lot_size == 1
+    assert candidate.verified is False
+
+
+def test_duplicate_key_error_names_config_path(tmp_path):
+    text = "schema_version: 1\nschema_version: 1\n" + _VALID_YAML.split("\n", 1)[1]
+    path = _write_raw(tmp_path, text)
+    with pytest.raises(InstrumentConfigError) as excinfo:
+        load_registry(path)
+    assert str(path) in str(excinfo.value)
