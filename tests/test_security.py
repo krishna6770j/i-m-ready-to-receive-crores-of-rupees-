@@ -788,6 +788,267 @@ def test_diagnostic_is_immutable():
 
 
 # ---------------------------------------------------------------------------
+# Unit 14 final hardening: control-character normalization must be complete
+# (all of \x00-\x1f and \x7f, including tab/LF/CR), and the diagnostic
+# boundary must reject unsafe structured-field VALUES, not just unknown
+# field NAMES.
+# ---------------------------------------------------------------------------
+
+
+def test_diagnostic_message_with_newlines_becomes_single_line():
+    """Adversarial test A."""
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR,
+        code=None,
+        sanitized_message="line1\nline2",
+    )
+    assert "\n" not in diag.sanitized_message
+    assert len(diag.sanitized_message.splitlines()) == 1
+
+
+def test_diagnostic_message_with_mixed_control_chars_is_fully_clean():
+    """Adversarial test B."""
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR,
+        code=None,
+        sanitized_message="a\rb\tc\x00d\x1be",
+    )
+    for ch in ("\r", "\t", "\x00", "\x1b"):
+        assert ch not in diag.sanitized_message
+    assert len(diag.sanitized_message.splitlines()) == 1
+
+
+def test_diagnostic_message_cr_is_removed():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR, code=None, sanitized_message="a\rb"
+    )
+    assert "\r" not in diag.sanitized_message
+
+
+def test_diagnostic_message_tab_is_removed():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR, code=None, sanitized_message="a\tb"
+    )
+    assert "\t" not in diag.sanitized_message
+
+
+def test_diagnostic_message_nul_is_removed():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR, code=None, sanitized_message="a\x00b"
+    )
+    assert "\x00" not in diag.sanitized_message
+
+
+def test_diagnostic_message_ansi_escape_is_removed():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR,
+        code=None,
+        sanitized_message="a\x1b[31mRED\x1b[0mb",
+    )
+    assert "\x1b" not in diag.sanitized_message
+
+
+def test_diagnostic_message_multiple_control_chars_all_removed():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    control = "".join(chr(c) for c in list(range(0x00, 0x20)) + [0x7F])
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR,
+        code=None,
+        sanitized_message=f"before{control}after",
+    )
+    for ch in control:
+        assert ch not in diag.sanitized_message
+
+
+def test_diagnostic_repr_and_str_contain_no_control_chars():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    diag = BrokerDiagnostic(
+        status=BrokerDiagnosticStatus.DATA_ERROR,
+        code=None,
+        sanitized_message="a\nb\rc\td\x00e",
+    )
+    for ch in ("\n", "\r", "\t", "\x00"):
+        assert ch not in repr(diag)
+        assert ch not in str(diag)
+
+
+def test_diagnostic_rejects_nested_dict_in_code_field():
+    """Adversarial test C."""
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    with pytest.raises(TypeError):
+        BrokerDiagnostic(
+            status=BrokerDiagnosticStatus.DATA_ERROR,
+            code=-99,
+            sanitized_message="generic error",
+            sanitized_structured_fields={"code": {"secret": "RAWSECRET"}},
+        )
+
+
+def test_diagnostic_rejects_list_in_status_field():
+    """Adversarial test D."""
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    with pytest.raises(TypeError):
+        BrokerDiagnostic(
+            status=BrokerDiagnosticStatus.DATA_ERROR,
+            code=-99,
+            sanitized_message="generic error",
+            sanitized_structured_fields={"status": ["bad", "RAWSECRET"]},
+        )
+
+
+def test_diagnostic_rejects_custom_object_before_repr_can_leak():
+    """Adversarial test E: a custom object's __repr__ must never even be
+    invoked -- rejection must happen on the type, not on stringified output.
+    """
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    class _Leaky:
+        def __repr__(self):
+            return "RAWSECRET"
+
+        def __str__(self):
+            return "RAWSECRET"
+
+    with pytest.raises(TypeError):
+        BrokerDiagnostic(
+            status=BrokerDiagnosticStatus.DATA_ERROR,
+            code=-99,
+            sanitized_message="generic error",
+            sanitized_structured_fields={"symbol": _Leaky()},
+        )
+
+
+def test_diagnostic_rejects_bool_as_code():
+    """Adversarial test F."""
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    with pytest.raises(TypeError):
+        BrokerDiagnostic(
+            status=BrokerDiagnosticStatus.DATA_ERROR,
+            code=True,
+            sanitized_message="generic error",
+        )
+
+
+def test_diagnostic_rejects_bool_as_structured_code():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    with pytest.raises(TypeError):
+        BrokerDiagnostic(
+            status=BrokerDiagnosticStatus.DATA_ERROR,
+            code=-99,
+            sanitized_message="generic error",
+            sanitized_structured_fields={"code": True},
+        )
+
+
+def test_diagnostic_rejects_raw_string_status_requires_enum():
+    """Adversarial test G."""
+    from brokers.diagnostics import BrokerDiagnostic
+
+    with pytest.raises(TypeError):
+        BrokerDiagnostic(
+            status="AUTH_ERROR",
+            code=-16,
+            sanitized_message="generic error",
+        )
+
+
+def test_diagnostic_rejects_non_str_message():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    with pytest.raises(TypeError):
+        BrokerDiagnostic(
+            status=BrokerDiagnosticStatus.DATA_ERROR,
+            code=None,
+            sanitized_message=12345,
+        )
+
+
+def test_diagnostic_rejects_non_mapping_structured_fields():
+    from brokers.diagnostics import BrokerDiagnostic, BrokerDiagnosticStatus
+
+    with pytest.raises(TypeError):
+        BrokerDiagnostic(
+            status=BrokerDiagnosticStatus.DATA_ERROR,
+            code=None,
+            sanitized_message="generic error",
+            sanitized_structured_fields=["not", "a", "mapping"],
+        )
+
+
+# ---------------------------------------------------------------------------
+# Unit 14 final hardening: SecretRegistry type boundary
+# ---------------------------------------------------------------------------
+
+
+def test_registry_rejects_bytes():
+    """Adversarial test K (part 1)."""
+    from core.secrets import SecretRegistry
+
+    reg = SecretRegistry()
+    with pytest.raises(TypeError):
+        reg.register(b"not a str")
+
+
+def test_registry_rejects_int():
+    """Adversarial test K (part 2)."""
+    from core.secrets import SecretRegistry
+
+    reg = SecretRegistry()
+    with pytest.raises(TypeError):
+        reg.register(123)
+
+
+def test_registry_rejects_list():
+    """Adversarial test K (part 3)."""
+    from core.secrets import SecretRegistry
+
+    reg = SecretRegistry()
+    with pytest.raises(TypeError):
+        reg.register([])
+
+
+def test_registry_rejects_arbitrary_object():
+    from core.secrets import SecretRegistry
+
+    reg = SecretRegistry()
+
+    class _Whatever:
+        pass
+
+    with pytest.raises(TypeError):
+        reg.register(_Whatever())
+
+
+def test_registry_does_not_stringify_rejected_values():
+    """A rejected non-string value must never be silently converted and
+    admitted -- the registry must not contain a str(value) fallback."""
+    from core.secrets import SecretRegistry
+
+    reg = SecretRegistry()
+    with pytest.raises(TypeError):
+        reg.register(123456)
+    assert "123456" not in reg
+
+
+# ---------------------------------------------------------------------------
 # Unit 14: historical adapter -- sanitized exceptions only
 # ---------------------------------------------------------------------------
 
@@ -860,3 +1121,71 @@ def test_historical_raw_broker_message_never_appears_in_exception_text():
         prov.fetch_chunk("X", "1", date(2026, 1, 1), date(2026, 1, 1))
     assert "NEVER_REGISTERED_SECRET_0009" not in str(excinfo.value)
     assert "NEVER_REGISTERED_SECRET_0009" not in repr(excinfo.value)
+
+
+def test_historical_malformed_code_dict_does_not_leak():
+    """Adversarial test H."""
+    from brokers.base import BrokerDataError
+    from brokers.fyers.historical import FyersHistoricalData
+    from tests.conftest import FakeFyersClient
+    from datetime import date
+
+    client = FakeFyersClient(
+        {
+            "s": "error",
+            "code": {"secret": "RAWSECRET_CODE_DICT"},
+            "message": "something broke",
+        }
+    )
+    prov = FyersHistoricalData(client, request_pause_seconds=0.0)
+    with pytest.raises(BrokerDataError) as excinfo:
+        prov.fetch_chunk("X", "1", date(2026, 1, 1), date(2026, 1, 1))
+    assert "RAWSECRET_CODE_DICT" not in str(excinfo.value)
+    assert "RAWSECRET_CODE_DICT" not in repr(excinfo.value)
+    assert "RAWSECRET_CODE_DICT" not in repr(excinfo.value.diagnostic)
+    assert "secret" not in repr(excinfo.value.diagnostic)
+
+
+def test_historical_malformed_status_list_does_not_leak():
+    """Adversarial test I."""
+    from brokers.base import BrokerDataError
+    from brokers.fyers.historical import FyersHistoricalData
+    from tests.conftest import FakeFyersClient
+    from datetime import date
+
+    client = FakeFyersClient(
+        {
+            "s": ["bad", "RAWSECRET_STATUS_LIST"],
+            "code": -99,
+            "message": "something broke",
+        }
+    )
+    prov = FyersHistoricalData(client, request_pause_seconds=0.0)
+    with pytest.raises(BrokerDataError) as excinfo:
+        prov.fetch_chunk("X", "1", date(2026, 1, 1), date(2026, 1, 1))
+    assert "RAWSECRET_STATUS_LIST" not in str(excinfo.value)
+    assert "RAWSECRET_STATUS_LIST" not in repr(excinfo.value)
+    assert "RAWSECRET_STATUS_LIST" not in repr(excinfo.value.diagnostic)
+
+
+def test_historical_crlf_and_unregistered_secret_in_message_does_not_escape():
+    """Adversarial test J."""
+    from brokers.base import BrokerDataError
+    from brokers.fyers.historical import FyersHistoricalData
+    from tests.conftest import FakeFyersClient
+    from datetime import date
+
+    client = FakeFyersClient(
+        {
+            "s": "error",
+            "code": -99,
+            "message": "line1\r\nsecret_key=NEVER_REGISTERED_CRLF_SECRET\r\nline2",
+        }
+    )
+    prov = FyersHistoricalData(client, request_pause_seconds=0.0)
+    with pytest.raises(BrokerDataError) as excinfo:
+        prov.fetch_chunk("X", "1", date(2026, 1, 1), date(2026, 1, 1))
+    text = str(excinfo.value)
+    assert "NEVER_REGISTERED_CRLF_SECRET" not in text
+    assert "\r" not in text
+    assert "\n" not in text

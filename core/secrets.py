@@ -48,9 +48,19 @@ class SecretRegistry:
         Rejects ``None`` and the empty string: neither is a secret value, and
         silently accepting them would mean ``scrub()`` does nothing useful
         for that "registration" while looking like it succeeded.
+
+        Requires ``type(secret) is str`` exactly -- bytes, int, list and
+        arbitrary objects are all rejected with ``TypeError`` rather than
+        silently converted. A non-string admitted into ``_secrets`` would
+        make ``secret in text`` raise ``TypeError`` the next time ``scrub()``
+        runs, inside logging -- turning a broken registration into a broken
+        logger. Conversion decisions belong at the call site that has the
+        real value (e.g. ``str(token)`` in the FYERS auth flow), not here.
         """
         if secret is None:
             raise ValueError("cannot register None as a secret")
+        if type(secret) is not str:
+            raise TypeError(f"secret must be a str, got {type(secret).__name__}")
         if secret == "":
             raise ValueError("cannot register an empty string as a secret")
         self._secrets.add(secret)

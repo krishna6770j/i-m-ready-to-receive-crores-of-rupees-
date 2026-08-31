@@ -34,6 +34,26 @@ from marketdata.schemas import TS, empty_ohlcv, from_fyers_candles, normalise
 logger = logging.getLogger(__name__)
 
 
+def _safe_status_scalar(value: object) -> str | None:
+    """Coerce a broker-supplied ``status`` value to what BrokerDiagnostic
+    accepts, WITHOUT calling ``str()`` on it. A malformed status (a dict, a
+    list, a custom object) is replaced with ``None`` rather than stringified
+    -- ``str()`` on an arbitrary object can invoke a ``__str__``/``__repr__``
+    that embeds arbitrary text, including a secret.
+    """
+    return value if isinstance(value, str) or value is None else None
+
+
+def _safe_code_scalar(value: object) -> int | str | None:
+    """Coerce a broker-supplied ``code`` value the same way; ``bool`` is
+    rejected too, matching BrokerDiagnostic's own rule that a diagnostic code
+    must never be a bool.
+    """
+    if isinstance(value, bool):
+        return None
+    return value if isinstance(value, (int, str)) or value is None else None
+
+
 @dataclass
 class ChunkResult:
     """Outcome of one /history request, for the coverage report."""
@@ -219,9 +239,13 @@ class FyersHistoricalData(HistoricalDataProvider):
 
         The raw payload/message exists only in this method's local scope, for
         classification. Only the broker's ``status`` and ``code`` -- both
-        allowlisted, non-free-text fields -- ever leave it via a
+        allowlisted, non-free-text fields, coerced to safe scalars via
+        ``_safe_status_scalar``/``_safe_code_scalar`` -- ever leave it via a
         BrokerDiagnostic; the raw message text itself is never logged,
-        stored, printed, or embedded in an exception.
+        stored, printed, or embedded in an exception. A malformed
+        status/code (e.g. a dict or list, from a broken or hostile response)
+        is replaced with ``None`` rather than stringified, since ``str()`` on
+        an arbitrary object can invoke a ``__repr__`` that leaks something.
         """
         if not isinstance(payload, dict):
             raise BrokerDataError(
@@ -250,12 +274,14 @@ class FyersHistoricalData(HistoricalDataProvider):
                 or "limit" in raw_message
                 or "too many" in raw_message
             )
-            fields = {"status": status, "code": code}
+            safe_status = _safe_status_scalar(status)
+            safe_code = _safe_code_scalar(code)
+            fields = {"status": safe_status, "code": safe_code}
             if is_auth:
                 raise BrokerAuthError(
                     BrokerDiagnostic(
                         status=BrokerDiagnosticStatus.AUTH_ERROR,
-                        code=code,
+                        code=safe_code,
                         sanitized_message=(
                             "FYERS rejected the request as unauthenticated. The "
                             "access token is short-lived and must be regenerated "
@@ -268,7 +294,7 @@ class FyersHistoricalData(HistoricalDataProvider):
                 raise BrokerRateLimitError(
                     BrokerDiagnostic(
                         status=BrokerDiagnosticStatus.RATE_LIMIT,
-                        code=code,
+                        code=safe_code,
                         sanitized_message="FYERS rate limit hit.",
                         sanitized_structured_fields=fields,
                     )
@@ -276,7 +302,7 @@ class FyersHistoricalData(HistoricalDataProvider):
             raise BrokerDataError(
                 BrokerDiagnostic(
                     status=BrokerDiagnosticStatus.DATA_ERROR,
-                    code=code,
+                    code=safe_code,
                     sanitized_message="FYERS /history returned an error.",
                     sanitized_structured_fields=fields,
                 )
